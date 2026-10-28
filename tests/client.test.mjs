@@ -70,7 +70,13 @@ function makeSidebar(options = {}) {
     activeId: options.activeId ?? 'tab1',
     expanded: options.expanded ?? true,
   }
-  const calls = { openTab: [], openResource: [], focus: [], close: [] }
+  const calls = { openTab: [], openResource: [], focus: [], close: [], openTabIn: [], openResourceIn: [], closeIn: [], focusTab: [] }
+  state.adopted = options.adopted ?? []
+  state.actions = {
+    focusTab(sessionId, tabId) {
+      calls.focusTab.push({ sessionId, tabId })
+    },
+  }
   const sidebarRight = {
     openTabs: { getSnapshot: () => state.inventory },
     tabsIn: () => state.committed,
@@ -90,6 +96,22 @@ function makeSidebar(options = {}) {
     },
     close(tabId) {
       calls.close.push(tabId)
+    },
+    openTabIn(sessionId, kind, openOptions) {
+      calls.openTabIn.push({ sessionId, kind, options: openOptions })
+      if (typeof options.onOpenTabIn === 'function') state.inventory = options.onOpenTabIn(sessionId, kind, openOptions, state.inventory)
+    },
+    openResourceIn(sessionId, address, resourceOptions) {
+      calls.openResourceIn.push({ sessionId, address, options: resourceOptions })
+      if (typeof options.onOpenResourceIn === 'function') state.inventory = options.onOpenResourceIn(sessionId, address, resourceOptions, state.inventory)
+    },
+    closeIn(sessionId, tabId) {
+      calls.closeIn.push({ sessionId, tabId })
+      state.inventory = state.inventory.filter((entry) => !(entry.sessionId === sessionId && entry.tabId === tabId))
+      state.committed = state.committed.filter((entry) => !(entry.sessionId === sessionId && entry.id === tabId))
+    },
+    actionsFor(sessionId) {
+      return state.adopted.includes(sessionId) ? state.actions : undefined
     },
   }
   return { sidebarRight, calls, state }
@@ -244,6 +266,22 @@ test('client: without the app session switcher an off-screen command fails clear
   await assert.rejects(() => provider.query('focus', { tabId: 'tab1' }, SESSION), /session switcher \(ctx\.uiWorkspace\) is unavailable/u)
 })
 
+test('client: switchView:false refuses a visible switch for an off-screen Session', async () => {
+  const { sidebarRight } = makeSidebar({ onScreen: 's1', inventory: [{ sessionId: 's2', tabId: 'tab1', kind: 'browser', contentId: 'a' }] })
+  const { provider } = makeProvider({ sidebarRight, uiWorkspace: { openSession: () => {} } })
+  await assert.rejects(() => provider.query('focus', { tabId: 'tab1', sessionId: 's2', switchView: false }, SESSION), /needs a temporary view switch/u)
+})
+
+test('client: switch reports how long the view switch took', async () => {
+  const { sidebarRight, state } = makeSidebar({ onScreen: 's1', inventory: [{ sessionId: 's2', tabId: 'tab1', kind: 'guide', contentId: 'sidebar://guide' }] })
+  const uiWorkspace = { openSession: (sessionId) => { state.onScreen = sessionId } }
+  const { provider } = makeProvider({ sidebarRight, uiWorkspace })
+  const data = await provider.query('focus', { tabId: 'tab1', sessionId: 's2' }, SESSION)
+  assert.equal(data.switched, true)
+  assert.equal(typeof data.switchMs, 'number')
+  assert.ok(data.switchMs >= 0)
+})
+
 test('client: switch and restore move the app view between Sessions', async () => {
   const { sidebarRight, state } = makeSidebar({ onScreen: 's2', inventory: [{ sessionId: 's1', tabId: 'tab1', kind: 'browser', contentId: 'a' }] })
   const opened = []
@@ -276,6 +314,53 @@ test('client: expand of an off-screen Session reports the tab metadata without s
   const { provider } = makeProvider({ sidebarRight })
   const data = await provider.query('expand', { tabId: 'tab1' }, SESSION)
   assert.equal(data.tabId, 'tab1')
+  assert.equal(data.onScreen, false)
+})
+
+test('client: open on an off-screen Session with a live store writes through it without switching', async () => {
+  const { sidebarRight, state, calls } = makeSidebar({
+    onScreen: 's1',
+    adopted: ['s2'],
+    inventory: [{ sessionId: 's2', tabId: 'tab1', kind: 'guide', contentId: 'sidebar://guide' }],
+    onOpenTabIn: (sessionId, kind, openOptions, inventory) => [...inventory, { sessionId, tabId: 'tab9', kind, contentId: `sidebar://${kind}` }],
+  })
+  const opened = []
+  const uiWorkspace = { openSession: (sessionId) => { opened.push(sessionId); state.onScreen = sessionId } }
+  const { provider } = makeProvider({ sidebarRight, uiWorkspace })
+  const data = await provider.query('open', { kind: 'guide', sessionId: 's2' }, SESSION)
+  assert.equal(data.seamless, true)
+  assert.equal(data.switched, false)
+  assert.equal(data.tabId, 'tab9')
+  assert.deepEqual(json(opened), [])
+  assert.equal(state.onScreen, 's1')
+  assert.equal(calls.openTabIn[0].sessionId, 's2')
+  assert.equal(calls.openTabIn[0].kind, 'guide')
+})
+
+test('client: focus and close on a live-store Session do not switch the view', async () => {
+  const { sidebarRight, state, calls } = makeSidebar({
+    onScreen: 's1',
+    adopted: ['s2'],
+    inventory: [{ sessionId: 's2', tabId: 'tab1', kind: 'guide', contentId: 'sidebar://guide' }],
+  })
+  const opened = []
+  const uiWorkspace = { openSession: (sessionId) => { opened.push(sessionId); state.onScreen = sessionId } }
+  const { provider } = makeProvider({ sidebarRight, uiWorkspace })
+  const focused = await provider.query('focus', { tabId: 'tab1', sessionId: 's2' }, SESSION)
+  assert.equal(focused.seamless, true)
+  assert.deepEqual(json(calls.focusTab), [{ sessionId: 's2', tabId: 'tab1' }])
+  const closed = await provider.query('close', { tabId: 'tab1', sessionId: 's2' }, SESSION)
+  assert.equal(closed.seamless, true)
+  assert.deepEqual(json(calls.closeIn), [{ sessionId: 's2', tabId: 'tab1' }])
+  assert.deepEqual(json(opened), [])
+  assert.equal(state.inventory.length, 0)
+})
+
+test('client: status marks a Session whose sidebar store is live', async () => {
+  const { sidebarRight } = makeSidebar({ onScreen: 's1', adopted: ['s2'], inventory: [{ sessionId: 's2', tabId: 'tab1', kind: 'guide', contentId: 'sidebar://guide' }] })
+  const { provider } = makeProvider({ sidebarRight })
+  const data = await provider.query('status', { sessionId: 's2' }, SESSION)
+  assert.equal(data.sessions[0].adopted, true)
   assert.equal(data.onScreen, false)
 })
 
@@ -332,6 +417,10 @@ test('client: pure address helpers keep drive letters and encode segments', () =
   assert.equal(helpers.encodeSegment('C:'), 'C:')
   assert.equal(helpers.isDrawn(null), false)
 })
+
+
+
+
 
 
 

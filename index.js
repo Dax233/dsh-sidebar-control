@@ -63,7 +63,7 @@ const DESCRIPTION =
   'action=focus and action=close take a tabId. ' +
   'action=expand returns one tab\'s content and the exact tools for it: a browser tab yields text (mode:text, default), interactive elements with refs (mode:elements) or page HTML (mode:html) plus the browser_* hand-off; a file tab yields a bounded text excerpt and the real path; a terminal tab names the terminal_* tools that read or drive it. ' +
   'Workflow: call status before acting on a tab you did not open, open what the user needs to see, expand only when you actually need the content, and drive browser pages with the browser_* tools (this tool is the overview/navigation plane, not a second browser implementation). ' +
-  'Another Session can be targeted with sessionId; status reads it directly, while open/focus/close/expand briefly show that Session in the main view (the switch is visible to the user) and then restore the previously shown Session. ' +
+  'Another Session can be targeted with sessionId: status reads it directly; open/focus/close write through that Session\'s live sidebar store (no view switch) when it has one (status marks it live-store), otherwise the command briefly shows that Session in the main view (visible to the user) and restores the previously shown Session; switchView:false refuses that visible switch instead. ' +
   'Boundaries: the Sidebar is per Session; commands act on the Session whose Sidebar is on screen and report when that surface is unavailable. ' +
   'The desktop shell isolates the in-app browser from the DSH Host origin: open {kind:"browser"} refuses any loopback hostname on the DSH Host port with an explicit policy error (file:// is likewise unavailable). ' +
   'A visible terminal tab is created by the Sidebar terminal plugin and is not necessarily the same terminal process as a terminal_* tool session; v0.1 reports that instead of pretending to bridge them. ' +
@@ -158,9 +158,20 @@ function switchNote(data) {
   if (data?.switched !== true) return undefined
   const target = typeof data.sessionId === 'string' && data.sessionId !== '' ? shortSession(data.sessionId) : 'the target Session'
   const previous = typeof data.previousSessionId === 'string' && data.previousSessionId !== '' ? shortSession(data.previousSessionId) : undefined
+  const timing = typeof data.switchMs === 'number' && data.switchMs >= 0 ? ` (switch took ${data.switchMs}ms)` : ''
   return previous === undefined
-    ? `note: the app temporarily showed Session ${target} to perform this (no previous Session to restore).`
-    : `note: the app temporarily showed Session ${target} to perform this, then restored Session ${previous}.`
+    ? `note: the app temporarily showed Session ${target} to perform this${timing} (no previous Session to restore).`
+    : `note: the app temporarily showed Session ${target} to perform this${timing}, then restored Session ${previous}.`
+}
+
+/**
+ * Receipt line explaining that a command on another Session wrote through that
+ * Session's live sidebar store without touching the main view.
+ */
+function seamlessNote(data) {
+  if (data?.seamless !== true) return undefined
+  const target = typeof data.sessionId === 'string' && data.sessionId !== '' ? shortSession(data.sessionId) : 'the target Session'
+  return `note: applied to Session ${target}'s live sidebar store without switching the main view; it is there when that conversation is opened.`
 }
 
 /** Render one tab row for the tree text. */
@@ -187,6 +198,7 @@ function formatStatus(data, settings) {
   let rendered = 0
   for (const session of sessions) {
     const flags = [`on-screen=${session?.onScreen === true ? 'yes' : 'no'}`]
+    if (session?.adopted === true) flags.push('live-store')
     if (typeof session?.expanded === 'boolean') flags.push(`expanded=${session.expanded ? 'yes' : 'no'}`)
     if (typeof session?.activeTabId === 'string' && session.activeTabId !== '') flags.push(`active=${session.activeTabId}`)
     lines.push(`session ${shortSession(session?.sessionId)} (${flags.join(', ')})`)
@@ -211,7 +223,7 @@ function formatStatus(data, settings) {
   if (data?.onScreen !== true) {
     const onScreen = typeof data?.onScreenSessionId === 'string' && data.onScreenSessionId !== '' ? shortSession(data.onScreenSessionId) : undefined
     lines.push(
-      `note: the requesting Session is not the one on screen${onScreen === undefined ? '' : ` (on-screen session ${onScreen})`}; navigation commands (open/focus/close/expand) briefly show this Session and then restore the on-screen one.`,
+      `note: the requesting Session is not the one on screen${onScreen === undefined ? '' : ` (on-screen session ${onScreen})`}; navigation commands apply through its live-store without switching when one is reported below, and otherwise briefly show this Session then restore the on-screen one.`,
     )
   }
   return lines.join('\n')
@@ -231,6 +243,8 @@ function formatOpen(data, kind) {
   lines.push(`sidebar open (${kind}): tab ${tabId}${where ? ` — ${where}` : ''}`)
   const switching = switchNote(data)
   if (switching !== undefined) lines.push(switching)
+  const seamless = seamlessNote(data)
+  if (seamless !== undefined) lines.push(seamless)
   if (typeof data?.tabKind === 'string' && data.tabKind !== '' && data.tabKind !== kind) {
     lines.push(`Sidebar tab kind: ${data.tabKind} (the requested "${kind}" kind is claimed by a more specific tab type)`)
   }
@@ -316,7 +330,7 @@ function promptText(lastTree, settings) {
     '- `sidebar open {kind:"browser",url}` opens the user-visible in-app browser (pass an existing browser `tabId` to navigate it in place); the DSH Host origin is refused with an explicit policy error. `{kind:"file",path,line?}` (relative paths resolve against the Session directory), `{kind:"terminal",shellPath?}`, `{kind:"guide"}` open the other kinds.',
     '- `sidebar focus {tabId}` / `sidebar close {tabId}`.',
     '- `sidebar expand {tabId, mode?}` only when the content is actually needed: browser tab → text (default) / elements with refs / html + the browser_* hand-off; file tab → bounded excerpt + real path; terminal tab → which terminal_* tools apply.',
-    '- Pass `sessionId` to work on another Session: status reads it; open/focus/close/expand briefly show that Session and then restore the one that was on screen (the switch is visible to the user, so prefer doing this when they are not mid-task).',
+    '- Pass `sessionId` to work on another Session: status reads it; open/focus/close apply through that Session\'s live sidebar store without switching when status marks it `live-store`, and otherwise briefly show that Session then restore the one that was on screen (the switch is visible to the user, so prefer doing this when they are not mid-task). expand reads file/terminal content without switching.',
     'Drive browser pages with the browser_* tools (browser_read → browser_act / browser_screenshot / browser_navigate); this tool is the overview/navigation plane.',
   ]
   const sessions = Array.isArray(lastTree?.sessions) ? lastTree.sessions : []
@@ -429,6 +443,11 @@ export function apply(ctx, config) {
     return { text: formatStatus(data, settings) }
   }
 
+  /** Command-side switchView preference: false refuses a visible switch. */
+  function switchViewOption(args) {
+    return args.switchView === false ? { switchView: false } : {}
+  }
+
   async function executeOpen(args, agent, signal) {
     const sessionId = optionalSessionId(args)
     const kind = String(args.kind ?? '')
@@ -482,7 +501,7 @@ export function apply(ctx, config) {
     } else {
       input = { kind, ...(sessionId === undefined ? {} : { sessionId }) }
     }
-    const data = await callClient('open', input, agent, signal)
+    const data = await callClient('open', { ...input, ...switchViewOption(args) }, agent, signal)
     return { text: formatOpen({ ...data, path: input.path, shellPath: input.shellPath, sessionId: data?.sessionId ?? sessionId }, kind) }
   }
 
@@ -490,8 +509,8 @@ export function apply(ctx, config) {
     const tabId = String(args.tabId ?? '')
     if (tabId === '') throw new Error('sidebar: tabId is required')
     const sessionId = optionalSessionId(args)
-    const data = await callClient('focus', { tabId, ...(sessionId === undefined ? {} : { sessionId }) }, agent, signal)
-    const note = switchNote({ ...data, sessionId: data?.sessionId ?? sessionId })
+    const data = await callClient('focus', { tabId, ...(sessionId === undefined ? {} : { sessionId }), ...switchViewOption(args) }, agent, signal)
+    const note = switchNote({ ...data, sessionId: data?.sessionId ?? sessionId }) ?? seamlessNote({ ...data, sessionId: data?.sessionId ?? sessionId })
     return { text: `sidebar focus: ${tabId} requested${note === undefined ? '' : `\n${note}`}` }
   }
 
@@ -499,8 +518,8 @@ export function apply(ctx, config) {
     const tabId = String(args.tabId ?? '')
     if (tabId === '') throw new Error('sidebar: tabId is required')
     const sessionId = optionalSessionId(args)
-    const data = await callClient('close', { tabId, ...(sessionId === undefined ? {} : { sessionId }) }, agent, signal)
-    const note = switchNote({ ...data, sessionId: data?.sessionId ?? sessionId })
+    const data = await callClient('close', { tabId, ...(sessionId === undefined ? {} : { sessionId }), ...switchViewOption(args) }, agent, signal)
+    const note = switchNote({ ...data, sessionId: data?.sessionId ?? sessionId }) ?? seamlessNote({ ...data, sessionId: data?.sessionId ?? sessionId })
     return { text: `sidebar close: ${tabId} closed${note === undefined ? '' : `\n${note}`}` }
   }
 
@@ -520,7 +539,7 @@ export function apply(ctx, config) {
     const sessionId = optionalSessionId(args)
     const maxChars = clampChars(args.maxChars, settings.maxExpandChars)
     const requestedMode = args.mode === 'elements' || args.mode === 'html' ? String(args.mode) : 'text'
-    const data = await callClient('expand', { tabId, ...(sessionId === undefined ? {} : { sessionId }) }, agent, signal)
+    const data = await callClient('expand', { tabId, ...(sessionId === undefined ? {} : { sessionId }), ...switchViewOption(args) }, agent, signal)
     let content
     let note
     let switched
@@ -537,7 +556,7 @@ export function apply(ctx, config) {
             `Read it from that Session's own conversation, or open the URL in this Session with sidebar open {kind:"browser",url}.`
         } else if (data.onScreen !== true) {
           // Reading a mounted guest needs its Session drawn; show it briefly.
-          switched = await callClient('switch', { sessionId: data.sessionId }, agent, signal)
+          switched = await callClient('switch', { sessionId: data.sessionId, ...switchViewOption(args) }, agent, signal)
           await delay(250)
         }
         let lastError
@@ -596,6 +615,7 @@ export function apply(ctx, config) {
             tabId: { type: 'string', description: 'Tab id from action=status: used by focus/close/expand, and by open {kind:"browser"} to navigate that existing browser tab in place.' },
             includeAllSessions: { type: 'boolean', description: 'For action=status: include Sessions other than the requesting one.' },
             sessionId: { type: 'string', description: 'Target Session for status/open/focus/close/expand (defaults to the requesting Session). Navigation commands briefly show that Session in the main view and restore the previously shown one.' },
+            switchView: { type: 'boolean', description: 'For another Session without a live sidebar store: allow the app to briefly show it (default true). false refuses without flashing the view.' },
             maxChars: { type: 'number', description: 'For action=expand: content character budget (default 4000, max 20000).' },
             mode: { type: 'string', enum: ['text', 'elements', 'html'], description: 'For action=expand on a browser tab: what to return (default text; elements carries the refs browser_act accepts; html is the page source).' },
           },
@@ -671,6 +691,11 @@ export const __test = {
   formatExpand,
   promptText,
 }
+
+
+
+
+
 
 
 

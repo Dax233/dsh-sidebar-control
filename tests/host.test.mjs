@@ -439,6 +439,53 @@ test('host: the prompt overview includes a browser tab URL', () => {
   assert.match(text, /tab1 browser "Example" <https:\/\/example\.com\/page>/u)
 })
 
+test('host: a switched receipt reports the switch duration; switchView:false is forwarded', async () => {
+  const calls = []
+  const registry = {
+    async query(_platform, _provider, _method, input) {
+      calls.push(input)
+      return { tabId: 'tab5', sessionId: 'target-session', switched: true, previousSessionId: 'home-session', switchMs: 123 }
+    },
+  }
+  const { tool } = makeHarness({ registry })
+  const result = await tool.execute({ action: 'focus', tabId: 'tab5', sessionId: 'target-session' }, { agent: {} })
+  assert.match(result.text, /switch took 123ms/u)
+  calls.length = 0
+  await tool.execute({ action: 'focus', tabId: 'tab5', sessionId: 'target-session', switchView: false }, { agent: {} })
+  assert.equal(calls[0].switchView, false)
+})
+test('host: status marks a Session whose sidebar store is live', async () => {
+  const registry = {
+    async query() {
+      return {
+        requestedSessionId: 's1',
+        onScreen: false,
+        onScreenSessionId: 's9',
+        sessions: [
+          { sessionId: 's1', onScreen: false, adopted: true, tabs: [{ tabId: 'tab1', kind: 'guide', contentId: 'sidebar://guide', mounted: false }] },
+        ],
+      }
+    },
+  }
+  const { tool } = makeHarness({ registry })
+  const result = await tool.execute({ action: 'status', sessionId: 's1' }, { agent: {} })
+  assert.match(result.text, /live-store/u)
+})
+
+test('host: receipts explain a live-store write that needed no switch', async () => {
+  const registry = {
+    async query(_platform, _provider, method) {
+      if (method === 'expand') throw new Error('not used')
+      return { seamless: true, switched: false, sessionId: 'target-session', tabId: 'tab5', kind: 'guide' }
+    },
+  }
+  const { tool } = makeHarness({ registry })
+  const opened = await tool.execute({ action: 'open', kind: 'guide', sessionId: 'target-session' }, { agent: {} })
+  assert.match(opened.text, /without switching the main view/u)
+  const focused = await tool.execute({ action: 'focus', tabId: 'tab5', sessionId: 'target-session' }, { agent: {} })
+  assert.match(focused.text, /live sidebar store without switching/u)
+})
+
 test('host: pure helpers mirror the shell policy and the file address grammar', () => {
   const host = 'http://127.0.0.1:55544'
   const blocked = [
@@ -482,6 +529,8 @@ test('host: tool refuses without an Agent-backed Session', async () => {
   const { tool } = makeHarness()
   await assert.rejects(() => tool.execute({ action: 'status' }, {}), /Agent-backed Session/u)
 })
+
+
 
 
 

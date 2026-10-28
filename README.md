@@ -54,15 +54,23 @@ never re-implements page reading. It talks to the renderer through the Cordis In
 - **Progressive disclosure.** The prompt section lists at most a handful of tabs as an overview;
   full content and the exact follow-up tools appear only in `sidebar expand` results, so the
   context budget follows actual need.
-- **Another Session is reachable (0.2.0).** Pass `sessionId` to `status`/`open`/`focus`/`close`/`expand`.
-  Read-only `status` needs no switch. Navigation commands ask the app to show that Session (the
-  same path a session-row click takes) and then restore the Session that was on screen, so the
-  view flickers briefly; receipts say which Sessions were involved. `expand` of a file tab works
+- **Another Session is reachable (0.2.x).** Pass `sessionId` to `status`/`open`/`focus`/`close`/`expand`.
+  Read-only `status` needs no switch. Navigation commands write through the target Session's
+  **live sidebar store** when it has one (`status` marks that Session `live-store`) and therefore
+  do not touch the view at all; a Session that has not been displayed since the app started has
+  no live store, so the app is asked to show it (the same path a session-row click takes) and then
+  restores the previous Session — receipts say which Sessions were involved and how long the
+  switch took (measured ~130–160 ms on 0.2.1-rc.3, so roughly 200–300 ms of another conversation).
+  The first operation on such a Session warms its store: every later operation on it is seamless
+  for the rest of the app run. `switchView: false` refuses the visible switch instead of flashing
+  the view (useful for Agents that must not disturb the user). `expand` of a file tab works
   without a switch (the Host reads the file directly) and relative paths resolve against the
-  target Session's working directory. Two limits stay, both from the adopted browser plugin's
-  session-scoped contract: the **content** of another Session's browser tab cannot be read (only
-  its metadata is returned), and an existing browser tab of another Session cannot be navigated
-  by `tabId` (open a new tab there instead).
+  target Session's working directory. Two further limits stay, both from the adopted browser
+  plugin's session-scoped contract: the **content** of another Session's browser tab cannot be
+  read (only its metadata is returned), and an existing browser tab of another Session cannot be
+  navigated by `tabId` (open a new tab there instead). **Why the first-touch switch cannot be
+  removed from this side**, and the upstream API that would remove it, are documented in
+  [`docs/upstream-sidebar-store.md`](docs/upstream-sidebar-store.md).
 
 ## Install
 

@@ -234,6 +234,16 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The target Session's adopted store actions, when its sidebar store is
+     * live (the Session was displayed since this app started). Acting through
+     * them needs no view switch; `undefined` means the public commands are
+     * on-screen-only and a switch would be required.
+     */
+    function liveActions(ctx, sessionId) {
+      return attempt(() => ctx.sidebarRight?.actionsFor?.(sessionId));
+    }
+
+    /**
      * Describe a Session's tabs: identity from the inventory + committed layout,
      * mount/visibility from the live DOM, URL/title from a browser guest.
      */
@@ -280,6 +290,7 @@ window.__ModuleLoader__.load({
       return {
         sessionId,
         onScreen: isOnScreen,
+        adopted: liveActions(ctx, sessionId) !== undefined,
         expanded: isOnScreen ? attempt(() => ctx.sidebarRight?.isExpanded?.()) : undefined,
         activeTabId: activeId,
         tabs,
@@ -321,6 +332,7 @@ window.__ModuleLoader__.load({
         return {
           sessionId,
           onScreen: described.onScreen,
+          adopted: described.adopted,
           expanded: described.expanded === undefined ? undefined : described.expanded === true,
           activeTabId: described.activeTabId,
           tabs: described.tabs,
@@ -353,7 +365,9 @@ window.__ModuleLoader__.load({
       for (;;) {
         if (onScreenSession(ctx) === sessionId) return true;
         if (Date.now() - started >= timeoutMs) return false;
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        // Keep the switch window short: the intermediate view is visible to the
+        // user, so poll at roughly one frame instead of tens of milliseconds.
+        await new Promise((resolve) => setTimeout(resolve, 12));
       }
     }
 
@@ -361,24 +375,31 @@ window.__ModuleLoader__.load({
      * Bring `sessionId` on screen. The Sidebar's public navigation commands act
      * on the Session whose Sidebar is drawn, so operating on another Session
      * means asking the app to show it exactly like a session-row click would;
-     * the caller restores the previously shown Session afterwards.
+     * the caller restores the previously shown Session afterwards. A caller that
+     * refuses the visible switch (`allowSwitch: false`) gets an error instead.
      */
-    async function switchToSession(ctx, sessionId, action) {
+    async function switchToSession(ctx, sessionId, action, options = {}) {
       const current = onScreenSession(ctx);
       if (current === sessionId) return { switched: false, previousSessionId: current };
+      if (options.allowSwitch === false) {
+        throw new Error(
+          `sidebar ${action}: this Session is not on screen and its sidebar store is not live, so acting on it needs a temporary view switch. Pass switchView:true (the default) to allow it, or open that conversation yourself first.`,
+        );
+      }
       const uiWorkspace = uiSwitcher(ctx);
       if (uiWorkspace === undefined) {
         throw new Error(
           `sidebar ${action}: this Session's Sidebar is not on screen and the app's session switcher (ctx.uiWorkspace) is unavailable, so it cannot be brought on screen`,
         );
       }
+      const started = Date.now();
       attempt(() => uiWorkspace.openSession(sessionId));
       if (!(await waitForOnScreen(ctx, sessionId, 4000))) {
         throw new Error(
           `sidebar ${action}: the app did not switch to Session ${sessionId} (it may be archived, closed, or the switch was refused); open that conversation first, then retry`,
         );
       }
-      return { switched: true, previousSessionId: current };
+      return { switched: true, previousSessionId: current, switchMs: Date.now() - started };
     }
 
     /**
@@ -399,32 +420,45 @@ window.__ModuleLoader__.load({
     }
 
     /** Run `run` with `sessionId` on screen, restoring the previous Session afterwards. */
-    async function withSessionOnScreen(ctx, sessionId, action, run) {
-      const switched = await switchToSession(ctx, sessionId, action);
+    async function withSessionOnScreen(ctx, sessionId, action, run, options = {}) {
+      const switched = await switchToSession(ctx, sessionId, action, options);
       try {
         const value = await run();
-        return { value, switched: switched.switched, previousSessionId: switched.previousSessionId };
+        return { value, switched: switched.switched, previousSessionId: switched.previousSessionId, switchMs: switched.switchMs };
       } finally {
         if (switched.switched) await restoreSession(ctx, switched.previousSessionId, sessionId);
       }
     }
 
-    /** Wait briefly for a newly opened tab to appear in the inventory. */
+    /** Wait briefly for a newly opened tab to appear in the inventory or store. */
     async function waitForNewTab(ctx, sessionId, before, timeoutMs) {
       const started = Date.now();
       for (;;) {
-        const fresh = inventoryOf(ctx, sessionId).find((entry) => !before.has(String(entry.tabId ?? '')));
+        const candidates = [...inventoryOf(ctx, sessionId), ...committedOf(ctx, sessionId)];
+        const fresh = candidates.find((entry) => !before.has(String(entry?.tabId ?? entry?.id ?? '')));
         if (fresh !== undefined) return fresh;
         if (Date.now() - started >= timeoutMs) return undefined;
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
     }
 
+    /** The tab id of an inventory/committed record, whichever shape it has. */
+    function tabIdOf(record) {
+      const value = record?.tabId ?? record?.id;
+      return typeof value === 'string' && value !== '' ? value : undefined;
+    }
+
     /** `open`: open a browser/file/terminal/guide tab in the target Session. */
     async function openView(ctx, input, context) {
       const sessionId = targetSessionOf(input, context);
-      const outcome = await withSessionOnScreen(ctx, sessionId, 'open', () => openOnScreen(ctx, input, sessionId));
-      return plain({ ...outcome.value, switched: outcome.switched, previousSessionId: outcome.previousSessionId });
+      if (onScreenSession(ctx) !== sessionId && liveActions(ctx, sessionId) !== undefined) {
+        // That Session's sidebar store is live, so the tab can be written
+        // through it without showing the Session at all.
+        const hidden = await openWithoutSwitch(ctx, input, sessionId);
+        if (hidden !== undefined) return plain({ ...hidden, sessionId, switched: false, seamless: true });
+      }
+      const outcome = await withSessionOnScreen(ctx, sessionId, 'open', () => openOnScreen(ctx, input, sessionId), { allowSwitch: input?.switchView !== false });
+      return plain({ ...outcome.value, switched: outcome.switched, previousSessionId: outcome.previousSessionId, switchMs: outcome.switchMs });
     }
 
     /** `open` body; runs while the target Session is on screen. */
@@ -460,23 +494,93 @@ window.__ModuleLoader__.load({
         sidebar.openTab('guide', {});
       }
       const fresh = await waitForNewTab(ctx, sessionId, before, 1500);
-      return plain({
+      return {
         kind,
         tabKind: fresh === undefined ? undefined : String(fresh.kind ?? ''),
         sessionId,
         address,
         params,
-        tabId: fresh === undefined ? undefined : String(fresh.tabId ?? ''),
+        tabId: tabIdOf(fresh),
         pending: fresh === undefined,
         note: fresh === undefined ? 'the tab was requested but has not appeared in the inventory yet; call status to confirm' : undefined,
-      });
+      };
+    }
+
+    /**
+     * Open a tab through the target Session's live store actions, without
+     * showing that Session. Returns `undefined` when the composition exposes no
+     * per-Session navigation path (the caller then falls back to a switch).
+     */
+    async function openWithoutSwitch(ctx, input, sessionId) {
+      const sidebar = sidebarOf(ctx);
+      const kind = String(input?.kind ?? '');
+      if (!OPEN_KINDS.includes(kind)) throw new Error(`sidebar open: kind must be one of ${OPEN_KINDS.join(', ')}`);
+      const openTabIn = typeof sidebar.openTabIn === 'function' ? sidebar.openTabIn.bind(sidebar) : undefined;
+      const openResourceIn = typeof sidebar.openResourceIn === 'function' ? sidebar.openResourceIn.bind(sidebar) : undefined;
+      const before = new Set(
+        [...inventoryOf(ctx, sessionId), ...committedOf(ctx, sessionId)]
+          .map((entry) => tabIdOf(entry))
+          .filter((id) => id !== undefined),
+      );
+      let address;
+      let params;
+      if (kind === 'browser') {
+        if (openTabIn === undefined) return undefined;
+        const url = String(input?.url ?? '').trim();
+        if (url === '') throw new Error('sidebar open: url is required for kind "browser"');
+        let parsed;
+        try {
+          parsed = new URL(url);
+        } catch {
+          throw new Error(`sidebar open: "${url}" is not a valid URL`);
+        }
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error(`sidebar open: url must use http:// or https://, got ${parsed.protocol}//`);
+        openTabIn(sessionId, 'browser', { params: { url: parsed.href } });
+        address = parsed.href;
+      } else if (kind === 'file') {
+        if (openResourceIn === undefined) return undefined;
+        const path = String(input?.path ?? '').trim();
+        if (path === '') throw new Error('sidebar open: path is required for kind "file"');
+        address = sessionFileAddress(sessionId, path);
+        params = Number.isFinite(input?.line) ? { line: Math.round(Number(input.line)) } : undefined;
+        openResourceIn(sessionId, address, params === undefined ? {} : { params });
+      } else if (kind === 'terminal') {
+        if (openTabIn === undefined) return undefined;
+        const shellPath = typeof input?.shellPath === 'string' && input.shellPath !== '' ? input.shellPath : undefined;
+        openTabIn(sessionId, 'terminal', shellPath === undefined ? {} : { params: { shellPath } });
+      } else {
+        if (openTabIn === undefined) return undefined;
+        openTabIn(sessionId, 'guide', {});
+      }
+      const fresh = await waitForNewTab(ctx, sessionId, before, 1500);
+      return {
+        kind,
+        tabKind: fresh === undefined ? undefined : String(fresh.kind ?? ''),
+        sessionId,
+        address,
+        params,
+        tabId: tabIdOf(fresh),
+        pending: fresh === undefined,
+        note: fresh === undefined ? 'the tab was requested but has not appeared in the inventory yet; call status to confirm' : undefined,
+      };
     }
 
     /** `focus`: reveal one tab of the target Session. */
     async function focusView(ctx, input, context) {
       const sessionId = targetSessionOf(input, context);
-      const outcome = await withSessionOnScreen(ctx, sessionId, 'focus', () => focusOnScreen(ctx, input, sessionId));
-      return plain({ ...outcome.value, switched: outcome.switched, previousSessionId: outcome.previousSessionId });
+      if (onScreenSession(ctx) !== sessionId) {
+        const actions = liveActions(ctx, sessionId);
+        if (actions !== undefined && typeof actions.focusTab === 'function') {
+          const tabId = String(input?.tabId ?? '');
+          if (tabId === '') throw new Error('sidebar focus: tabId is required');
+          const known = [...inventoryOf(ctx, sessionId), ...committedOf(ctx, sessionId)].some((entry) => tabIdOf(entry) === tabId);
+          if (!known) throw new Error(`sidebar focus: no tab "${tabId}" in this Session; call sidebar status first`);
+          actions.focusTab(sessionId, tabId);
+          return plain({ tabId, sessionId, focused: true, onScreen: false, switched: false, seamless: true });
+        }
+      }
+      const outcome = await withSessionOnScreen(ctx, sessionId, 'focus', () => focusOnScreen(ctx, input, sessionId), { allowSwitch: input?.switchView !== false });
+      return plain({ ...outcome.value, switched: outcome.switched, previousSessionId: outcome.previousSessionId, switchMs: outcome.switchMs });
     }
 
     /** `focus` body; runs while the target Session is on screen. */
@@ -493,8 +597,20 @@ window.__ModuleLoader__.load({
     /** `close`: remove one tab of the target Session. */
     async function closeView(ctx, input, context) {
       const sessionId = targetSessionOf(input, context);
-      const outcome = await withSessionOnScreen(ctx, sessionId, 'close', () => closeOnScreen(ctx, input, sessionId));
-      return plain({ ...outcome.value, switched: outcome.switched, previousSessionId: outcome.previousSessionId });
+      if (onScreenSession(ctx) !== sessionId) {
+        const sidebar = sidebarOf(ctx);
+        const actions = liveActions(ctx, sessionId);
+        if (actions !== undefined && typeof sidebar.closeIn === 'function') {
+          const tabId = String(input?.tabId ?? '');
+          if (tabId === '') throw new Error('sidebar close: tabId is required');
+          const known = [...inventoryOf(ctx, sessionId), ...committedOf(ctx, sessionId)].some((entry) => tabIdOf(entry) === tabId);
+          if (!known) throw new Error(`sidebar close: no tab "${tabId}" in this Session; call sidebar status first`);
+          sidebar.closeIn(sessionId, tabId);
+          return plain({ tabId, sessionId, closed: true, switched: false, seamless: true });
+        }
+      }
+      const outcome = await withSessionOnScreen(ctx, sessionId, 'close', () => closeOnScreen(ctx, input, sessionId), { allowSwitch: input?.switchView !== false });
+      return plain({ ...outcome.value, switched: outcome.switched, previousSessionId: outcome.previousSessionId, switchMs: outcome.switchMs });
     }
 
     /** `close` body; runs while the target Session is on screen. */
@@ -522,11 +638,12 @@ window.__ModuleLoader__.load({
     /** `switch`: show a Session in the main view (so its Sidebar becomes actionable). */
     async function switchView(ctx, input, context) {
       const sessionId = targetSessionOf(input, context);
-      const switched = await switchToSession(ctx, sessionId, 'switch');
+      const switched = await switchToSession(ctx, sessionId, 'switch', { allowSwitch: input?.switchView !== false });
       return plain({
         sessionId,
         switched: switched.switched,
         previousSessionId: switched.previousSessionId,
+        switchMs: switched.switchMs,
         onScreen: onScreenSession(ctx) === sessionId,
       });
     }
@@ -577,6 +694,7 @@ window.__ModuleLoader__.load({
                   line: { type: 'number', description: 'One-based source line for kind "file".' },
                   shellPath: { type: 'string', description: 'Shell executable for kind "terminal"; the Sidebar default when omitted.' },
                   sessionId: { type: 'string', description: 'Target Session; defaults to the requesting Session. A different Session is shown in the main view while the command runs, then restored.' },
+                  switchView: { type: 'boolean', description: 'Allow that temporary view switch when the target Session has no live sidebar store (default true); false fails instead of flashing the view.' },
                 },
                 required: ['kind'],
                 additionalProperties: false,
@@ -591,6 +709,7 @@ window.__ModuleLoader__.load({
                 properties: {
                   tabId: { type: 'string', description: 'Tab id from status.' },
                   sessionId: { type: 'string', description: 'Target Session; defaults to the requesting Session.' },
+                  switchView: { type: 'boolean', description: 'Allow a temporary view switch when the target Session has no live sidebar store (default true); false fails instead of flashing the view.' },
                 },
                 required: ['tabId'],
                 additionalProperties: false,
@@ -605,6 +724,7 @@ window.__ModuleLoader__.load({
                 properties: {
                   tabId: { type: 'string', description: 'Tab id from status.' },
                   sessionId: { type: 'string', description: 'Target Session; defaults to the requesting Session.' },
+                  switchView: { type: 'boolean', description: 'Allow a temporary view switch when the target Session has no live sidebar store (default true); false fails instead of flashing the view.' },
                 },
                 required: ['tabId'],
                 additionalProperties: false,
@@ -619,6 +739,7 @@ window.__ModuleLoader__.load({
                 properties: {
                   tabId: { type: 'string', description: 'Tab id from status.' },
                   sessionId: { type: 'string', description: 'Target Session; defaults to the requesting Session.' },
+                  switchView: { type: 'boolean', description: 'Allow a temporary view switch when the target Session has no live sidebar store (default true); false fails instead of flashing the view.' },
                 },
                 required: ['tabId'],
                 additionalProperties: false,
@@ -630,7 +751,10 @@ window.__ModuleLoader__.load({
               description: 'Show a Session in the main view so its Sidebar can be acted on; reports the previously shown Session for restore.',
               inputSchema: {
                 type: 'object',
-                properties: { sessionId: { type: 'string', description: 'Session to show; defaults to the requesting Session.' } },
+                properties: {
+                  sessionId: { type: 'string', description: 'Session to show; defaults to the requesting Session.' },
+                  switchView: { type: 'boolean', description: 'Allow the view switch (default true); false fails when the target is not on screen.' },
+                },
                 required: [],
                 additionalProperties: false,
               },
@@ -701,6 +825,10 @@ window.__ModuleLoader__.load({
     return module.exports;
   },
 });
+
+
+
+
 
 
 
