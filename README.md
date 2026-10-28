@@ -11,10 +11,11 @@ tools, terminals with `terminal_*`).
 
 ```
 sidebar status                     → tree: tabId, kind, title, url/path, active, mounted
-sidebar open {kind:"browser", url} → opens the user-visible in-app browser tab
-sidebar open {kind:"file", path}   → opens a document-preview tab (line: source line)
-sidebar open {kind:"terminal"}     → opens a visible terminal tab
-sidebar expand {tabId}             → pulls that tab's content + names the exact tools for it
+sidebar open {kind:"browser", url}        → opens the user-visible in-app browser tab
+sidebar open {kind:"browser", url, tabId} → navigates that existing browser tab in place
+sidebar open {kind:"file", path, line?}   → document-preview tab (relative paths resolve against the Session directory)
+sidebar open {kind:"terminal"}            → opens a visible terminal tab
+sidebar expand {tabId, mode?}             → content + the exact tools for it (mode: text/elements/html on browser tabs)
 sidebar focus / close {tabId}      → navigation verbs
 ```
 
@@ -96,4 +97,5 @@ stays with the tools that do (and those already wrap page content as untrusted d
 ## License
 
 MIT.
+
 

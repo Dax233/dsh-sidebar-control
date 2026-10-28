@@ -59,9 +59,9 @@ const DEFAULTS = {
 const DESCRIPTION =
   'Inspect and control the DSH right Sidebar as one workspace. ' +
   'action=status returns the open tabs of the requesting Session (or every Session with includeAllSessions) as a compact tree: tabId, kind (browser/terminal/file/guide), title, url or path, active, mounted. ' +
-  'action=open opens a tab: {kind:"browser",url} (the user-visible in-app browser; the same tab the browser_* tools drive), {kind:"file",path,line?} (document preview), {kind:"terminal",shellPath?} (a visible terminal), or {kind:"guide"}. ' +
+  'action=open opens a tab: {kind:"browser",url} (the user-visible in-app browser; the same tab the browser_* tools drive; pass an existing browser tabId to navigate that tab instead of opening another), {kind:"file",path,line?} (document preview; a relative path resolves against the Session working directory), {kind:"terminal",shellPath?} (a visible terminal), or {kind:"guide"}. ' +
   'action=focus and action=close take a tabId. ' +
-  'action=expand returns one tab\'s content and the exact tools for it: a browser tab yields its text plus the browser_read/browser_act/browser_screenshot/browser_navigate hand-off; a file tab yields a bounded text excerpt and the real path; a terminal tab names the terminal_* tools that read or drive it. ' +
+  'action=expand returns one tab\'s content and the exact tools for it: a browser tab yields text (mode:text, default), interactive elements with refs (mode:elements) or page HTML (mode:html) plus the browser_* hand-off; a file tab yields a bounded text excerpt and the real path; a terminal tab names the terminal_* tools that read or drive it. ' +
   'Workflow: call status before acting on a tab you did not open, open what the user needs to see, expand only when you actually need the content, and drive browser pages with the browser_* tools (this tool is the overview/navigation plane, not a second browser implementation). ' +
   'Boundaries: the Sidebar is per Session; commands act on the Session whose Sidebar is on screen and report when that surface is unavailable. ' +
   'The desktop shell isolates the in-app browser from the DSH Host origin: open {kind:"browser"} refuses any loopback hostname on the DSH Host port with an explicit policy error (file:// is likewise unavailable). ' +
@@ -221,7 +221,7 @@ function formatOpen(data, kind) {
 }
 
 /** Render the tool's `expand` receipt. */
-function formatExpand(data, content, note) {
+function formatExpand(data, content, note, mode) {
   const flags = []
   if (data?.active === true) flags.push('active')
   if (data?.mounted === true) flags.push('mounted')
@@ -232,6 +232,7 @@ function formatExpand(data, content, note) {
   if (typeof data?.url === 'string' && data.url !== '') lines.push(`url: ${data.url}`)
   if (typeof data?.path === 'string' && data.path !== '') lines.push(`path: ${data.path}`)
   if (typeof data?.contentId === 'string' && data.contentId !== '') lines.push(`contentId: ${data.contentId}`)
+  if (typeof mode === 'string' && mode !== '' && mode !== 'text' && content !== undefined) lines.push(`content mode: ${mode}`)
   if (typeof note === 'string' && note !== '') lines.push(note)
   if (typeof content === 'string' && content !== '') {
     lines.push('content:')
@@ -249,6 +250,19 @@ function formatExpand(data, content, note) {
     lines.push('next: this tab kind is inventory-only; it can be focused or closed but its content is not readable from here.')
   }
   return lines.join('\n')
+}
+
+/**
+ * The inspect channel wraps a provider's failure in its own timeout text; the
+ * provider's diagnosis is the actionable part, so surface that instead of the
+ * wrapper. Returns the original message when it carries no provider failure.
+ */
+function unwrapInspectError(error) {
+  const message = String(error && error.message ? error.message : error)
+  const providerFailure = /Client failure:\s*([\s\S]+)$/u.exec(message)
+  if (providerFailure === null) return message
+  const diagnosis = providerFailure[1].trim().replace(/^provider-error:\s*/iu, '')
+  return diagnosis
 }
 
 /**
@@ -275,9 +289,9 @@ function promptText(lastTree, settings) {
     '## Sidebar control plane (dsh-sidebar-control)',
     'The right Sidebar is one workspace of tabs (browser, terminal, file preview, guide). Use `sidebar` instead of guessing its state.',
     '- `sidebar status` → compact tree: tabId, kind, title, url/path, active/mounted. Call it before acting on tabs you did not open.',
-    '- `sidebar open {kind:"browser",url}` opens the user-visible in-app browser; the DSH Host origin is refused with an explicit policy error. `{kind:"file",path,line?}`, `{kind:"terminal",shellPath?}`, `{kind:"guide"}` open the other kinds.',
+    '- `sidebar open {kind:"browser",url}` opens the user-visible in-app browser (pass an existing browser `tabId` to navigate it in place); the DSH Host origin is refused with an explicit policy error. `{kind:"file",path,line?}` (relative paths resolve against the Session directory), `{kind:"terminal",shellPath?}`, `{kind:"guide"}` open the other kinds.',
     '- `sidebar focus {tabId}` / `sidebar close {tabId}`.',
-    '- `sidebar expand {tabId}` only when the content is actually needed: browser tab → text + the browser_* hand-off; file tab → bounded excerpt + real path; terminal tab → which terminal_* tools apply.',
+    '- `sidebar expand {tabId, mode?}` only when the content is actually needed: browser tab → text (default) / elements with refs / html + the browser_* hand-off; file tab → bounded excerpt + real path; terminal tab → which terminal_* tools apply.',
     'Drive browser pages with the browser_* tools (browser_read → browser_act / browser_screenshot / browser_navigate); this tool is the overview/navigation plane.',
   ]
   const sessions = Array.isArray(lastTree?.sessions) ? lastTree.sessions : []
@@ -295,7 +309,8 @@ function promptText(lastTree, settings) {
           break
         }
         const title = typeof tab.title === 'string' && tab.title !== '' ? ` "${tab.title.slice(0, 40)}"` : ''
-        lines.push(`  - ${tab.tabId} ${tab.kind}${title}${tab.active === true ? ' [active]' : ''}`)
+        const where = tab.kind === 'browser' && typeof tab.url === 'string' && tab.url !== '' ? ` <${tab.url.slice(0, 60)}>` : ''
+        lines.push(`  - ${tab.tabId} ${tab.kind}${title}${where}${tab.active === true ? ' [active]' : ''}`)
         rendered += 1
       }
       if (rendered > settings.maxPromptTabs) break
@@ -320,14 +335,39 @@ export function apply(ctx, config) {
     if (registry === undefined) {
       throw new Error('sidebar: the Cordis inspect registry is not mounted in this composition, so the Sidebar cannot be reached')
     }
-    return registry.query('client', PROVIDER, method, input, agent, signal)
+    try {
+      return await registry.query('client', PROVIDER, method, input, agent, signal)
+    } catch (error) {
+      throw new Error(unwrapInspectError(error))
+    }
   }
 
   /** Query the adopted browser plugin's Client provider, when it is installed. */
   async function callBrowserProvider(method, input, agent, signal) {
     const registry = ctx.get('cordisInspect')
     if (registry === undefined) throw new Error('sidebar: the Cordis inspect registry is not mounted')
-    return registry.query('client', BROWSER_PROVIDER, method, input, agent, signal)
+    try {
+      return await registry.query('client', BROWSER_PROVIDER, method, input, agent, signal)
+    } catch (error) {
+      throw new Error(unwrapInspectError(error))
+    }
+  }
+
+  /**
+   * The requesting Session's effective working directory, used to resolve a
+   * relative file path against the workspace the agent is actually in (the Host
+   * process cwd is a deployment detail, not the Session's directory).
+   */
+  async function sessionWorkingDirectory(agent, signal) {
+    try {
+      const workingDirectory = ctx.get('workingDirectory')
+      if (workingDirectory !== undefined && typeof workingDirectory.ensure === 'function') {
+        return await workingDirectory.ensure(agent, signal)
+      }
+    } catch {
+      // Fall back to the Host cwd.
+    }
+    return process.cwd()
   }
 
   /** Refresh the prompt overview from the last answered tree. */
@@ -360,10 +400,21 @@ export function apply(ctx, config) {
         }
       }
       input = { kind, url: url.href }
+      const targetTab = typeof args.tabId === 'string' && args.tabId !== '' ? args.tabId : undefined
+      if (targetTab !== undefined) {
+        // Reusing an existing browser tab avoids tab sprawl: navigate it in place.
+        await callBrowserProvider('navigate', { url: url.href, tabId: targetTab }, agent, signal)
+        return {
+          text:
+            `sidebar open (browser): navigated tab ${targetTab} to ${url.href}\n` +
+            `next: browser_read {tabId:"${targetTab}"} to read it; browser_act/browser_screenshot drive the same tab.`,
+        }
+      }
     } else if (kind === 'file') {
       const raw = String(args.path ?? '').trim()
       if (raw === '') throw new Error('sidebar: path is required for kind "file"')
-      const path = isAbsolute(raw) ? raw : resolve(process.cwd(), raw)
+      const base = isAbsolute(raw) ? undefined : await sessionWorkingDirectory(agent, signal)
+      const path = base === undefined ? raw : resolve(base, raw)
       input = { kind, path, ...(Number.isFinite(args.line) ? { line: Number(args.line) } : {}) }
     } else if (kind === 'terminal') {
       input = { kind, ...(typeof args.shellPath === 'string' && args.shellPath !== '' ? { shellPath: args.shellPath } : {}) }
@@ -392,26 +443,36 @@ export function apply(ctx, config) {
     const tabId = String(args.tabId ?? '')
     if (tabId === '') throw new Error('sidebar: tabId is required')
     const maxChars = clampChars(args.maxChars, settings.maxExpandChars)
+    const requestedMode = args.mode === 'elements' || args.mode === 'html' ? String(args.mode) : 'text'
     const data = await callClient('expand', { tabId }, agent, signal)
     let content
     let note
     if (data?.kind === 'browser') {
       try {
-        const read = await callBrowserProvider('read', { tabId, mode: 'text', maxChars }, agent, signal)
-        content = read?.text ?? read?.value?.text
-        if (typeof content !== 'string') note = 'the browser provider answered but returned no text; the page may be empty or still loading'
+        const read = await callBrowserProvider('read', { tabId, mode: requestedMode, maxChars }, agent, signal)
+        if (requestedMode === 'text') {
+          content = read?.text ?? read?.value?.text
+        } else if (requestedMode === 'html') {
+          content = read?.html ?? read?.value?.html
+        } else {
+          const elements = read?.elements ?? read?.value?.elements ?? read
+          content = typeof elements === 'string' ? elements : JSON.stringify(elements, null, 2)
+        }
+        if (typeof content !== 'string') note = 'the browser provider answered but returned no content for this mode; the page may be empty or still loading'
+        else if (content.length > maxChars) content = `${content.slice(0, maxChars)}\n… (${content.length - maxChars} more chars)`
       } catch (error) {
         note = `the browser provider could not read this tab: ${String(error && error.message ? error.message : error)}`
       }
     } else if (typeof data?.path === 'string' && data.path !== '') {
-      const path = isAbsolute(data.path) ? data.path : resolve(process.cwd(), data.path)
+      const base = isAbsolute(data.path) ? undefined : await sessionWorkingDirectory(agent, signal)
+      const path = base === undefined ? data.path : resolve(base, data.path)
       const excerpt = readTextExcerpt(path, maxChars, settings.maxFileBytes)
       if (typeof excerpt.text === 'string') content = excerpt.text
       else note = `could not read ${path}: ${excerpt.error}`
     } else if (data?.kind === 'file' || data?.kind === 'text') {
       note = 'this file tab was opened before this Session; its path is not recorded here — read it with the file tools when you know the path'
     }
-    return { text: formatExpand(data, content, note) }
+    return { text: formatExpand(data, content, note, data?.kind === 'browser' ? requestedMode : undefined) }
   }
 
   ctx.effect(
@@ -425,12 +486,13 @@ export function apply(ctx, config) {
             action: { type: 'string', enum: ACTIONS, description: 'What to do with the Sidebar.' },
             kind: { type: 'string', enum: OPEN_KINDS, description: 'Tab kind for action=open: browser, file, terminal or guide.' },
             url: { type: 'string', description: 'HTTP(S) URL for action=open, kind=browser.' },
-            path: { type: 'string', description: 'Absolute (or Host-cwd-relative) file path for action=open, kind=file.' },
+            path: { type: 'string', description: 'Absolute (or Session-working-directory-relative) file path for action=open, kind=file.' },
             line: { type: 'number', description: 'One-based source line for action=open, kind=file.' },
             shellPath: { type: 'string', description: 'Shell executable for action=open, kind=terminal; the Sidebar default when omitted.' },
-            tabId: { type: 'string', description: 'Tab id from action=status for focus/close/expand.' },
+            tabId: { type: 'string', description: 'Tab id from action=status: used by focus/close/expand, and by open {kind:"browser"} to navigate that existing browser tab in place.' },
             includeAllSessions: { type: 'boolean', description: 'For action=status: include Sessions other than the requesting one.' },
             maxChars: { type: 'number', description: 'For action=expand: content character budget (default 4000, max 20000).' },
+            mode: { type: 'string', enum: ['text', 'elements', 'html'], description: 'For action=expand on a browser tab: what to return (default text; elements carries the refs browser_act accepts; html is the page source).' },
           },
           required: ['action'],
           additionalProperties: false,

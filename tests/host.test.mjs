@@ -38,6 +38,7 @@ function makeHarness(options = {}) {
       if (key === 'cordisInspect') return registry
       if (key === 'systemPrompt') return systemPrompt
       if (key === 'webServer') return options.webServer
+      if (key === 'workingDirectory') return options.workingDirectory
       return undefined
     },
     effect(execute) {
@@ -113,7 +114,7 @@ test('host: status renders a session tree and caches it for the prompt section',
   assert.equal(sections[0].order, 3050)
   const text = sections[0].text()
   assert.match(text, /Last seen sidebar/u)
-  assert.match(text, /tab1 browser "Example Domain" \[active\]/u)
+  assert.match(text, /tab1 browser "Example Domain" <https:\/\/example\.com\/> \[active\]/u)
 })
 
 test('host: status reports Sessions without tabs and non-on-screen warnings', async () => {
@@ -270,6 +271,82 @@ test('host: an open receipt names the actual Sidebar kind when a resource type c
   assert.match(result.text, /Sidebar tab kind: text/u)
 })
 
+test('host: inspect-channel wrappers are unwrapped to the provider diagnosis', async () => {
+  const registry = {
+    async query() {
+      throw new Error(
+        'Client inspect query SidebarControl.open timed out after 10000ms. Client failure: provider-error: sidebar open: this Session\'s Sidebar is not on screen (no Session is on screen). Sidebar commands act on the on-screen Session only',
+      )
+    },
+  }
+  const { tool } = makeHarness({ registry })
+  await assert.rejects(
+    () => tool.execute({ action: 'open', kind: 'guide' }, { agent: {} }),
+    (error) => {
+      assert.doesNotMatch(error.message, /Client failure|timed out after/u)
+      assert.match(error.message, /Sidebar is not on screen/u)
+      return true
+    },
+  )
+})
+
+test('host: a relative file path resolves against the Session working directory', async () => {
+  const calls = []
+  const registry = {
+    async query(_platform, _provider, method, input) {
+      calls.push({ method, input })
+      return { kind: input.kind, tabId: 'tab6', sessionId: 's1' }
+    },
+  }
+  const workingDirectory = { ensure: async () => join(tmpdir(), 'session-workspace') }
+  const { tool } = makeHarness({ registry, workingDirectory })
+  await tool.execute({ action: 'open', kind: 'file', path: 'notes.md' }, { agent: {} })
+  assert.equal(calls[0].input.path, join(tmpdir(), 'session-workspace', 'notes.md'))
+})
+
+test('host: open browser with an existing tabId navigates that tab instead of opening another', async () => {
+  const calls = []
+  const registry = {
+    async query(_platform, provider, method, input) {
+      calls.push({ provider, method, input })
+      if (provider === 'AgentBrowser' && method === 'navigate') return { tabId: input.tabId, url: input.url }
+      throw new Error('the sidebar client half must not be asked to open a new tab here')
+    },
+  }
+  const { tool } = makeHarness({ registry })
+  const result = await tool.execute({ action: 'open', kind: 'browser', url: 'https://example.org/', tabId: 'tab4' }, { agent: {} })
+  assert.match(result.text, /navigated tab tab4 to https:\/\/example\.org\//u)
+  assert.deepEqual(calls.map((entry) => `${entry.provider}.${entry.method}`), ['AgentBrowser.navigate'])
+  assert.equal(calls[0].input.url, 'https://example.org/')
+  assert.equal(calls[0].input.tabId, 'tab4')
+})
+
+test('host: expand mode=elements passes through and returns the elements JSON', async () => {
+  const calls = []
+  const registry = {
+    async query(_platform, provider, method, input) {
+      calls.push({ provider, method, input })
+      if (provider === 'SidebarControl') return { tabId: 'tab1', kind: 'browser', url: 'https://example.com/' }
+      if (provider === 'AgentBrowser') return { tabId: 'tab1', elements: [{ ref: 'e1', role: 'link', name: 'More' }] }
+      throw new Error('unexpected provider')
+    },
+  }
+  const { tool } = makeHarness({ registry })
+  const result = await tool.execute({ action: 'expand', tabId: 'tab1', mode: 'elements' }, { agent: {} })
+  assert.match(result.text, /content mode: elements/u)
+  assert.match(result.text, /"ref": "e1"/u)
+  const browserCall = calls.find((entry) => entry.provider === 'AgentBrowser')
+  assert.equal(browserCall.input.mode, 'elements')
+})
+
+test('host: the prompt overview includes a browser tab URL', () => {
+  const text = __test.promptText(
+    { sessions: [{ sessionId: 's1', onScreen: true, tabs: [{ tabId: 'tab1', kind: 'browser', title: 'Example', url: 'https://example.com/page' }] }] },
+    __test.DEFAULTS,
+  )
+  assert.match(text, /tab1 browser "Example" <https:\/\/example\.com\/page>/u)
+})
+
 test('host: pure helpers mirror the shell policy and the file address grammar', () => {
   const host = 'http://127.0.0.1:55544'
   const blocked = [
@@ -313,5 +390,8 @@ test('host: tool refuses without an Agent-backed Session', async () => {
   const { tool } = makeHarness()
   await assert.rejects(() => tool.execute({ action: 'status' }, {}), /Agent-backed Session/u)
 })
+
+
+
 
 
