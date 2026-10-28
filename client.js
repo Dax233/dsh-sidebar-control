@@ -238,9 +238,13 @@ window.__ModuleLoader__.load({
      * mount/visibility from the live DOM, URL/title from a browser guest.
      */
     function describeSession(ctx, sessionId) {
+      const isOnScreen = onScreenSession(ctx) === sessionId;
       const wrappers = tabWrappers(sessionId);
       const committed = new Map(committedOf(ctx, sessionId).map((record) => [record?.id, record]));
-      const activeTab = attempt(() => ctx.sidebarRight?.active?.());
+      // `active()` and `isExpanded()` describe the on-screen Sidebar only; for
+      // any other Session they would be another Session's answers, so they stay
+      // undefined instead of being attributed to the wrong tree.
+      const activeTab = isOnScreen ? attempt(() => ctx.sidebarRight?.active?.()) : undefined;
       const activeId = typeof activeTab?.id === 'string' ? activeTab.id : undefined;
       const tabs = inventoryOf(ctx, sessionId).map((entry) => {
         const tabId = String(entry.tabId ?? '');
@@ -275,8 +279,8 @@ window.__ModuleLoader__.load({
       // DOM is the authority for "mounted".
       return {
         sessionId,
-        onScreen: onScreenSession(ctx) === sessionId,
-        expanded: attempt(() => ctx.sidebarRight?.isExpanded?.()),
+        onScreen: isOnScreen,
+        expanded: isOnScreen ? attempt(() => ctx.sidebarRight?.isExpanded?.()) : undefined,
         activeTabId: activeId,
         tabs,
         tabsById,
@@ -317,7 +321,7 @@ window.__ModuleLoader__.load({
         return {
           sessionId,
           onScreen: described.onScreen,
-          expanded: described.expanded === true,
+          expanded: described.expanded === undefined ? undefined : described.expanded === true,
           activeTabId: described.activeTabId,
           tabs: described.tabs,
         };
@@ -327,6 +331,20 @@ window.__ModuleLoader__.load({
         onScreen: sessions.some((session) => session.sessionId === requested && session.onScreen),
         sessions,
       });
+    }
+
+    /**
+     * Sidebar commands act on the Session whose Sidebar is drawn. A command for
+     * any other Session has no adopted store to write into; say that plainly
+     * instead of reporting a request that silently went nowhere.
+     */
+    function requireOnScreen(ctx, sessionId, action) {
+      const onScreen = onScreenSession(ctx);
+      if (onScreen === sessionId) return;
+      const where = onScreen === undefined ? 'no Session is on screen' : `the on-screen Session is ${onScreen.slice(0, 8)}…`;
+      throw new Error(
+        `sidebar ${action}: this Session's Sidebar is not on screen (${where}). Sidebar commands act on the on-screen Session only — switch DSH to the Session whose Sidebar is visible, then retry.`,
+      );
     }
 
     /** Wait briefly for a newly opened tab to appear in the inventory. */
@@ -344,6 +362,7 @@ window.__ModuleLoader__.load({
     async function openView(ctx, input, context) {
       const sessionId = sessionOf(context);
       const sidebar = sidebarOf(ctx);
+      requireOnScreen(ctx, sessionId, 'open');
       const kind = String(input?.kind ?? '');
       if (!OPEN_KINDS.includes(kind)) throw new Error(`sidebar open: kind must be one of ${OPEN_KINDS.join(', ')}`);
       const before = new Set(inventoryOf(ctx, sessionId).map((entry) => String(entry.tabId ?? '')));
@@ -390,6 +409,7 @@ window.__ModuleLoader__.load({
     function focusView(ctx, input, context) {
       const sessionId = sessionOf(context);
       const sidebar = sidebarOf(ctx);
+      requireOnScreen(ctx, sessionId, 'focus');
       const tabId = String(input?.tabId ?? '');
       if (tabId === '') throw new Error('sidebar focus: tabId is required');
       const known = inventoryOf(ctx, sessionId).some((entry) => String(entry.tabId ?? '') === tabId);
@@ -402,6 +422,7 @@ window.__ModuleLoader__.load({
     function closeView(ctx, input, context) {
       const sessionId = sessionOf(context);
       const sidebar = sidebarOf(ctx);
+      requireOnScreen(ctx, sessionId, 'close');
       const tabId = String(input?.tabId ?? '');
       if (tabId === '') throw new Error('sidebar close: tabId is required');
       const known = inventoryOf(ctx, sessionId).some((entry) => String(entry.tabId ?? '') === tabId);
@@ -414,6 +435,7 @@ window.__ModuleLoader__.load({
     function expandView(ctx, input, context) {
       const sessionId = sessionOf(context);
       const tabId = String(input?.tabId ?? '');
+      requireOnScreen(ctx, sessionId, 'expand');
       if (tabId === '') throw new Error('sidebar expand: tabId is required');
       const described = describeSession(ctx, sessionId);
       const tab = described.tabsById.get(tabId);
@@ -544,5 +566,7 @@ window.__ModuleLoader__.load({
     return module.exports;
   },
 });
+
+
 
 

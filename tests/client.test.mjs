@@ -210,6 +210,25 @@ test('client: open terminal and guide use their kinds', async () => {
   assert.deepEqual(json(calls.openTab[1].options), {})
 })
 
+test('client: commands for a Session whose Sidebar is not on screen are refused', async () => {
+  const { sidebarRight } = makeSidebar({ onScreen: 's2', inventory: [{ sessionId: 's1', tabId: 'tab1', kind: 'browser', contentId: 'a' }] })
+  const { provider } = makeProvider({ sidebarRight })
+  await assert.rejects(() => provider.query('open', { kind: 'guide' }, SESSION), /Sidebar is not on screen/u)
+  await assert.rejects(() => provider.query('focus', { tabId: 'tab1' }, SESSION), /Sidebar is not on screen/u)
+  await assert.rejects(() => provider.query('close', { tabId: 'tab1' }, SESSION), /Sidebar is not on screen/u)
+  const status = await provider.query('status', {}, SESSION)
+  assert.equal(status.onScreen, false)
+  assert.equal(status.sessions[0].onScreen, false)
+  assert.equal(status.sessions[0].expanded, undefined, 'expanded comes from the on-screen Session and must not be attributed to another Session')
+  assert.equal(status.sessions[0].activeTabId, undefined, 'activeTabId comes from the on-screen Session and must not be attributed to another Session')
+})
+
+test('client: expand refuses an off-screen Session as well', async () => {
+  const { sidebarRight } = makeSidebar({ onScreen: 's2', inventory: [{ sessionId: 's1', tabId: 'tab1', kind: 'browser', contentId: 'a' }] })
+  const { provider } = makeProvider({ sidebarRight })
+  await assert.rejects(() => provider.query('expand', { tabId: 'tab1' }, SESSION), /Sidebar is not on screen/u)
+})
+
 test('client: open reports pending when the inventory never grows', async () => {
   const { sidebarRight } = makeSidebar()
   const { provider } = makeProvider({ sidebarRight })
@@ -263,4 +282,5 @@ test('client: pure address helpers keep drive letters and encode segments', () =
   assert.equal(helpers.encodeSegment('C:'), 'C:')
   assert.equal(helpers.isDrawn(null), false)
 })
+
 

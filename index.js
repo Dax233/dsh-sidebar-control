@@ -167,7 +167,8 @@ function formatStatus(data, settings) {
   )
   let rendered = 0
   for (const session of sessions) {
-    const flags = [`on-screen=${session?.onScreen === true ? 'yes' : 'no'}`, `expanded=${session?.expanded === true ? 'yes' : 'no'}`]
+    const flags = [`on-screen=${session?.onScreen === true ? 'yes' : 'no'}`]
+    if (typeof session?.expanded === 'boolean') flags.push(`expanded=${session.expanded ? 'yes' : 'no'}`)
     if (typeof session?.activeTabId === 'string' && session.activeTabId !== '') flags.push(`active=${session.activeTabId}`)
     lines.push(`session ${shortSession(session?.sessionId)} (${flags.join(', ')})`)
     const tabs = Array.isArray(session?.tabs) ? session.tabs : []
@@ -503,4 +504,5 @@ export const __test = {
   formatExpand,
   promptText,
 }
+
 
