@@ -24,7 +24,7 @@ function makeHarness(options = {}) {
             return () => {}
           },
           getSectionOrder(key) {
-            return key === 'TOOLS' ? 100 : 500
+            return key === 'TOOL_COMPUTER_USE' ? 3000 : undefined
           },
         }
   const ctx = {
@@ -110,7 +110,7 @@ test('host: status renders a session tree and caches it for the prompt section',
   assert.equal(registry.calls[0].method, 'status')
   assert.equal(sections.length, 1)
   assert.equal(sections[0].name, 'tools:sidebar-control')
-  assert.equal(sections[0].order, 100)
+  assert.equal(sections[0].order, 3050)
   const text = sections[0].text()
   assert.match(text, /Last seen sidebar/u)
   assert.match(text, /tab1 browser "Example Domain" \[active\]/u)
@@ -243,6 +243,33 @@ test('host: expand a file tab returns a bounded excerpt and the real path', asyn
   assert.match(result.text, /use the read tool/u)
 })
 
+test('host: expand reads an excerpt for a resource-derived "text" tab as well', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'sidebar-control-text-'))
+  const file = join(directory, 'note.txt')
+  writeFileSync(file, 'resource text content\n')
+  const registry = {
+    async query(_platform, provider) {
+      if (provider === 'SidebarControl') return { tabId: 'tab12', kind: 'text', path: file, contentId: 'dsh-resource://file/session/s1/note.txt' }
+      throw new Error('unexpected provider')
+    },
+  }
+  const { tool } = makeHarness({ registry })
+  const result = await tool.execute({ action: 'expand', tabId: 'tab12' }, { agent: {} })
+  assert.match(result.text, /resource text content/u)
+  assert.match(result.text, /use the read tool/u)
+})
+
+test('host: an open receipt names the actual Sidebar kind when a resource type claimed it', async () => {
+  const registry = {
+    async query() {
+      return { kind: 'file', tabKind: 'text', sessionId: 's1', address: 'dsh-resource://file/session/s1/a.md', tabId: 'tab13' }
+    },
+  }
+  const { tool } = makeHarness({ registry })
+  const result = await tool.execute({ action: 'open', kind: 'file', path: 'C:\\tmp\\a.md' }, { agent: {} })
+  assert.match(result.text, /Sidebar tab kind: text/u)
+})
+
 test('host: pure helpers mirror the shell policy and the file address grammar', () => {
   const host = 'http://127.0.0.1:55544'
   const blocked = [
@@ -286,3 +313,5 @@ test('host: tool refuses without an Agent-backed Session', async () => {
   const { tool } = makeHarness()
   await assert.rejects(() => tool.execute({ action: 'status' }, {}), /Agent-backed Session/u)
 })
+
+

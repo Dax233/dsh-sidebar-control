@@ -91,22 +91,37 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** Whether an element is actually drawn (not hidden by display/visibility/zero size). */
+    /**
+     * Whether an element is actually drawn. Tab bodies are often wrapped in a
+     * `display: contents` marker, whose own box is zero-sized, so the check looks
+     * at the element and a bounded set of descendants instead of trusting the
+     * wrapper rect; a hidden tab has neither a visible box nor a visible
+     * descendant, and Chromium's `checkVisibility` answers directly when present.
+     */
     function isDrawn(element) {
       if (element === undefined || element === null) return false;
       try {
-        const rect = element.getBoundingClientRect();
-        if (!(rect.width > 0) || !(rect.height > 0)) return false;
-        let node = element;
-        while (node !== null && node !== undefined) {
-          if (node.hidden === true) return false;
-          if (typeof node.getAttribute === 'function' && node.getAttribute('aria-hidden') === 'true') return false;
-          node = node.parentElement;
+        if (typeof element.checkVisibility === 'function') {
+          if (element.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true }) === true) return true;
         }
-        return true;
       } catch {
-        return false;
+        // Fall through to geometry.
       }
+      const nodes = [element];
+      try {
+        nodes.push(...[...element.querySelectorAll('*')].slice(0, 64));
+      } catch {
+        // A stub DOM in tests may not implement querySelectorAll.
+      }
+      for (const node of nodes) {
+        try {
+          const rect = node.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) return true;
+        } catch {
+          // Keep looking.
+        }
+      }
+      return false;
     }
 
     /** Every tab body wrapper of one Session, keyed by tab id (first wins). */
@@ -121,8 +136,15 @@ window.__ModuleLoader__.load({
       }
       for (const wrapper of wrappers) {
         const tabId = wrapper?.dataset?.sidebarRightTab;
-        if (typeof tabId !== 'string' || tabId === '' || found.has(tabId)) continue;
-        found.set(tabId, wrapper);
+        if (typeof tabId !== 'string' || tabId === '') continue;
+        // The tab chip and the tab body both carry `data-sidebar-right-tab`;
+        // the body is the one that can hold a browser guest, so prefer it.
+        const existing = found.get(tabId);
+        if (existing === undefined) {
+          found.set(tabId, wrapper);
+          continue;
+        }
+        if (browserGuest(existing) === undefined && browserGuest(wrapper) !== undefined) found.set(tabId, wrapper);
       }
       return found;
     }
@@ -228,6 +250,10 @@ window.__ModuleLoader__.load({
         const contentId = typeof entry.contentId === 'string' ? entry.contentId : committedRecord?.contentId;
         const guest = kind === 'browser' ? browserGuest(wrapper) : undefined;
         const identity = guestIdentity(guest);
+        // A browser tab is mounted only when its guest exists; a bare chip does
+        // not render the page. Other kinds own no guest marker we can read, so
+        // the wrapper is the best mount signal available there.
+        const mounted = kind === 'browser' ? guest !== undefined : wrapper !== undefined;
         const parsed = kind === 'file' || (typeof contentId === 'string' && contentId.startsWith(FILE_ADDRESS_PREFIX)) ? parseFileAddress(contentId) : undefined;
         return {
           tabId,
@@ -237,7 +263,7 @@ window.__ModuleLoader__.load({
           url: identity.url,
           contentId,
           path: parsed?.path,
-          mounted: wrapper !== undefined,
+          mounted,
           drawn: isDrawn(wrapper),
           hasGuest: guest !== undefined,
           active: tabId !== '' && tabId === activeId,
@@ -350,6 +376,7 @@ window.__ModuleLoader__.load({
       const fresh = await waitForNewTab(ctx, sessionId, before, 1500);
       return plain({
         kind,
+        tabKind: fresh === undefined ? undefined : String(fresh.kind ?? ''),
         sessionId,
         address,
         params,
@@ -517,3 +544,5 @@ window.__ModuleLoader__.load({
     return module.exports;
   },
 });
+
+

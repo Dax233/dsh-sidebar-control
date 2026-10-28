@@ -206,6 +206,9 @@ function formatOpen(data, kind) {
     return lines.join('\n')
   }
   lines.push(`sidebar open (${kind}): tab ${tabId}${where ? ` — ${where}` : ''}`)
+  if (typeof data?.tabKind === 'string' && data.tabKind !== '' && data.tabKind !== kind) {
+    lines.push(`Sidebar tab kind: ${data.tabKind} (the requested "${kind}" kind is claimed by a more specific tab type)`)
+  }
   if (kind === 'browser') {
     lines.push(`next: browser_read {tabId:"${tabId}"} to read it; browser_act/browser_screenshot/browser_navigate drive the same tab; sidebar expand {tabId:"${tabId}"} returns the text.`)
   } else if (kind === 'file') {
@@ -235,8 +238,10 @@ function formatExpand(data, content, note) {
   }
   if (data?.kind === 'browser') {
     lines.push(`next: browser_read {tabId:"${String(data.tabId)}", mode:"elements"} for clickable refs, then browser_act/browser_navigate/browser_screenshot on the same tabId.`)
-  } else if (data?.kind === 'file') {
+  } else if (typeof data?.path === 'string' && data.path !== '') {
     lines.push('next: use the read tool on the path above (expand only returns a bounded excerpt).')
+  } else if (data?.kind === 'file' || data?.kind === 'text') {
+    lines.push('next: use the read tool on the path above when you know it (expand only returns a bounded excerpt).')
   } else if (data?.kind === 'terminal') {
     lines.push('next: terminal_list / terminal_read for terminal_* tool sessions; this tab is a separate visible terminal in v0.1.')
   } else {
@@ -397,15 +402,13 @@ export function apply(ctx, config) {
       } catch (error) {
         note = `the browser provider could not read this tab: ${String(error && error.message ? error.message : error)}`
       }
-    } else if (data?.kind === 'file') {
-      const path = typeof data.path === 'string' && data.path !== '' ? (isAbsolute(data.path) ? data.path : resolve(process.cwd(), data.path)) : undefined
-      if (path === undefined) {
-        note = 'this file tab was opened before this Session; its path is not recorded here — read it with the file tools when you know the path'
-      } else {
-        const excerpt = readTextExcerpt(path, maxChars, settings.maxFileBytes)
-        if (typeof excerpt.text === 'string') content = excerpt.text
-        else note = `could not read ${path}: ${excerpt.error}`
-      }
+    } else if (typeof data?.path === 'string' && data.path !== '') {
+      const path = isAbsolute(data.path) ? data.path : resolve(process.cwd(), data.path)
+      const excerpt = readTextExcerpt(path, maxChars, settings.maxFileBytes)
+      if (typeof excerpt.text === 'string') content = excerpt.text
+      else note = `could not read ${path}: ${excerpt.error}`
+    } else if (data?.kind === 'file' || data?.kind === 'text') {
+      note = 'this file tab was opened before this Session; its path is not recorded here — read it with the file tools when you know the path'
     }
     return { text: formatExpand(data, content, note) }
   }
@@ -469,11 +472,16 @@ export function apply(ctx, config) {
   // the tool still works, so a composition without it is not an error.
   const systemPrompt = ctx.get('systemPrompt')
   if (systemPrompt !== undefined && typeof systemPrompt.section === 'function') {
+    // The system-prompt section registry has no generic "tools" slot; the tool
+    // documentation block ends around TOOL_COMPUTER_USE/MCP_SERVERS, so the
+    // overview sits just after computer use (unknown keys resolve to undefined).
+    const anchor = typeof systemPrompt.getSectionOrder === 'function' ? systemPrompt.getSectionOrder('TOOL_COMPUTER_USE') : undefined
+    const order = Number.isFinite(anchor) ? anchor + 50 : 3050
     ctx.effect(
       () =>
         systemPrompt.section({
           name: 'tools:sidebar-control',
-          order: typeof systemPrompt.getSectionOrder === 'function' ? systemPrompt.getSectionOrder('TOOLS') : 100,
+          order,
           text: () => promptText(lastTree, settings),
         }),
       'dsh-sidebar-control.prompt',
@@ -495,3 +503,4 @@ export const __test = {
   formatExpand,
   promptText,
 }
+
