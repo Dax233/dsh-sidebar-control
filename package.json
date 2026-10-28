@@ -1,6 +1,6 @@
 {
   "name": "dsh-sidebar-control",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Agent-facing control plane for the DSH right Sidebar: a hierarchical overview of open tabs (browser, terminal, file preview, guide), open/focus/close across tab kinds, and progressive disclosure (expand a tab to pull its content plus the exact tools that act on it).",
@@ -46,4 +46,5 @@
     "test": "node --test tests/host.test.mjs tests/client.test.mjs"
   }
 }
+
 

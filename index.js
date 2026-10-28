@@ -63,6 +63,7 @@ const DESCRIPTION =
   'action=focus and action=close take a tabId. ' +
   'action=expand returns one tab\'s content and the exact tools for it: a browser tab yields text (mode:text, default), interactive elements with refs (mode:elements) or page HTML (mode:html) plus the browser_* hand-off; a file tab yields a bounded text excerpt and the real path; a terminal tab names the terminal_* tools that read or drive it. ' +
   'Workflow: call status before acting on a tab you did not open, open what the user needs to see, expand only when you actually need the content, and drive browser pages with the browser_* tools (this tool is the overview/navigation plane, not a second browser implementation). ' +
+  'Another Session can be targeted with sessionId; status reads it directly, while open/focus/close/expand briefly show that Session in the main view (the switch is visible to the user) and then restore the previously shown Session. ' +
   'Boundaries: the Sidebar is per Session; commands act on the Session whose Sidebar is on screen and report when that surface is unavailable. ' +
   'The desktop shell isolates the in-app browser from the DSH Host origin: open {kind:"browser"} refuses any loopback hostname on the DSH Host port with an explicit policy error (file:// is likewise unavailable). ' +
   'A visible terminal tab is created by the Sidebar terminal plugin and is not necessarily the same terminal process as a terminal_* tool session; v0.1 reports that instead of pretending to bridge them. ' +
@@ -144,6 +145,24 @@ function clampChars(value, fallback) {
   return Math.min(20000, Math.max(200, Math.round(number)))
 }
 
+/** Resolve after `ms` milliseconds. */
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Receipt line explaining that a command briefly showed another Session so its
+ * Sidebar was actionable, and that the previously shown Session came back.
+ */
+function switchNote(data) {
+  if (data?.switched !== true) return undefined
+  const target = typeof data.sessionId === 'string' && data.sessionId !== '' ? shortSession(data.sessionId) : 'the target Session'
+  const previous = typeof data.previousSessionId === 'string' && data.previousSessionId !== '' ? shortSession(data.previousSessionId) : undefined
+  return previous === undefined
+    ? `note: the app temporarily showed Session ${target} to perform this (no previous Session to restore).`
+    : `note: the app temporarily showed Session ${target} to perform this, then restored Session ${previous}.`
+}
+
 /** Render one tab row for the tree text. */
 function tabLine(tab) {
   const flags = []
@@ -192,7 +211,7 @@ function formatStatus(data, settings) {
   if (data?.onScreen !== true) {
     const onScreen = typeof data?.onScreenSessionId === 'string' && data.onScreenSessionId !== '' ? shortSession(data.onScreenSessionId) : undefined
     lines.push(
-      `note: the requesting Session is not the one on screen${onScreen === undefined ? '' : ` (on-screen session ${onScreen})`}; open/focus/close act on the on-screen Session only.`,
+      `note: the requesting Session is not the one on screen${onScreen === undefined ? '' : ` (on-screen session ${onScreen})`}; navigation commands (open/focus/close/expand) briefly show this Session and then restore the on-screen one.`,
     )
   }
   return lines.join('\n')
@@ -210,6 +229,8 @@ function formatOpen(data, kind) {
     return lines.join('\n')
   }
   lines.push(`sidebar open (${kind}): tab ${tabId}${where ? ` — ${where}` : ''}`)
+  const switching = switchNote(data)
+  if (switching !== undefined) lines.push(switching)
   if (typeof data?.tabKind === 'string' && data.tabKind !== '' && data.tabKind !== kind) {
     lines.push(`Sidebar tab kind: ${data.tabKind} (the requested "${kind}" kind is claimed by a more specific tab type)`)
   }
@@ -295,6 +316,7 @@ function promptText(lastTree, settings) {
     '- `sidebar open {kind:"browser",url}` opens the user-visible in-app browser (pass an existing browser `tabId` to navigate it in place); the DSH Host origin is refused with an explicit policy error. `{kind:"file",path,line?}` (relative paths resolve against the Session directory), `{kind:"terminal",shellPath?}`, `{kind:"guide"}` open the other kinds.',
     '- `sidebar focus {tabId}` / `sidebar close {tabId}`.',
     '- `sidebar expand {tabId, mode?}` only when the content is actually needed: browser tab → text (default) / elements with refs / html + the browser_* hand-off; file tab → bounded excerpt + real path; terminal tab → which terminal_* tools apply.',
+    '- Pass `sessionId` to work on another Session: status reads it; open/focus/close/expand briefly show that Session and then restore the one that was on screen (the switch is visible to the user, so prefer doing this when they are not mid-task).',
     'Drive browser pages with the browser_* tools (browser_read → browser_act / browser_screenshot / browser_navigate); this tool is the overview/navigation plane.',
   ]
   const sessions = Array.isArray(lastTree?.sessions) ? lastTree.sessions : []
@@ -356,10 +378,22 @@ export function apply(ctx, config) {
     }
   }
 
+  /** Live Agent of another Session, when it exists (used to resolve its workspace). */
+  function agentFor(ctx, sessionId) {
+    if (typeof sessionId !== 'string' || sessionId === '') return undefined
+    try {
+      const agents = ctx.get('agents')
+      return typeof agents?.get === 'function' ? agents.get(sessionId) : undefined
+    } catch {
+      return undefined
+    }
+  }
+
   /**
-   * The requesting Session's effective working directory, used to resolve a
-   * relative file path against the workspace the agent is actually in (the Host
-   * process cwd is a deployment detail, not the Session's directory).
+   * Effective working directory of a Session, used to resolve a relative file
+   * path against the workspace the agent is actually in (the Host process cwd is
+   * a deployment detail, not the Session's directory). An explicit target
+   * Session passes its own Agent so its workspace wins.
    */
   async function sessionWorkingDirectory(agent, signal) {
     try {
@@ -378,13 +412,25 @@ export function apply(ctx, config) {
     if (value !== undefined && value !== null && Array.isArray(value.sessions)) lastTree = value
   }
 
+  /** `sessionId` from the tool args, or undefined for the requesting Session. */
+  function optionalSessionId(args) {
+    return typeof args.sessionId === 'string' && args.sessionId !== '' ? args.sessionId : undefined
+  }
+
   async function executeStatus(args, agent, signal) {
-    const data = await callClient('status', { includeAllSessions: args.includeAllSessions === true }, agent, signal)
+    const sessionId = optionalSessionId(args)
+    const data = await callClient(
+      'status',
+      { ...(sessionId === undefined ? {} : { sessionId }), includeAllSessions: args.includeAllSessions === true },
+      agent,
+      signal,
+    )
     rememberTree(data)
     return { text: formatStatus(data, settings) }
   }
 
   async function executeOpen(args, agent, signal) {
+    const sessionId = optionalSessionId(args)
     const kind = String(args.kind ?? '')
     if (!OPEN_KINDS.includes(kind)) throw new Error(`sidebar: kind for open must be one of ${OPEN_KINDS.join(', ')}, got "${kind}"`)
     let input
@@ -402,10 +448,21 @@ export function apply(ctx, config) {
             `or a separate standalone 'dsh web' instance to inspect the GUI. (target: ${blocked.target})`,
         }
       }
-      input = { kind, url: url.href }
+      input = { kind, url: url.href, ...(sessionId === undefined ? {} : { sessionId }) }
       const targetTab = typeof args.tabId === 'string' && args.tabId !== '' ? args.tabId : undefined
       if (targetTab !== undefined) {
         // Reusing an existing browser tab avoids tab sprawl: navigate it in place.
+        // The adopted browser provider resolves tabs within the querying Agent's
+        // Session, so a tab of another Session cannot be addressed safely (per-
+        // Session tab ids can collide); ask for a new tab instead.
+        const agentSessionId = typeof agent?.id === 'string' ? agent.id : undefined
+        if (sessionId !== undefined && agentSessionId !== undefined && sessionId !== agentSessionId) {
+          return {
+            text:
+              `sidebar open (browser): cannot navigate tab ${targetTab} in another Session — the browser provider scopes tabs to the requesting Agent's Session (tab ids are per-Session and can collide). ` +
+              `Open a new browser tab there with sidebar open {kind:"browser",url:"${url.href}",sessionId:"${sessionId}"} instead.`,
+          }
+        }
         await callBrowserProvider('navigate', { url: url.href, tabId: targetTab }, agent, signal)
         return {
           text:
@@ -416,55 +473,97 @@ export function apply(ctx, config) {
     } else if (kind === 'file') {
       const raw = String(args.path ?? '').trim()
       if (raw === '') throw new Error('sidebar: path is required for kind "file"')
-      const base = isAbsolute(raw) ? undefined : await sessionWorkingDirectory(agent, signal)
+      const owner = sessionId === undefined ? agent : agentFor(ctx, sessionId) ?? agent
+      const base = isAbsolute(raw) ? undefined : await sessionWorkingDirectory(owner, signal)
       const path = base === undefined ? raw : resolve(base, raw)
-      input = { kind, path, ...(Number.isFinite(args.line) ? { line: Number(args.line) } : {}) }
+      input = { kind, path, ...(Number.isFinite(args.line) ? { line: Number(args.line) } : {}), ...(sessionId === undefined ? {} : { sessionId }) }
     } else if (kind === 'terminal') {
-      input = { kind, ...(typeof args.shellPath === 'string' && args.shellPath !== '' ? { shellPath: args.shellPath } : {}) }
+      input = { kind, ...(typeof args.shellPath === 'string' && args.shellPath !== '' ? { shellPath: args.shellPath } : {}), ...(sessionId === undefined ? {} : { sessionId }) }
     } else {
-      input = { kind }
+      input = { kind, ...(sessionId === undefined ? {} : { sessionId }) }
     }
     const data = await callClient('open', input, agent, signal)
-    return { text: formatOpen({ ...data, path: input.path, shellPath: input.shellPath }, kind) }
+    return { text: formatOpen({ ...data, path: input.path, shellPath: input.shellPath, sessionId: data?.sessionId ?? sessionId }, kind) }
   }
 
   async function executeFocus(args, agent, signal) {
     const tabId = String(args.tabId ?? '')
     if (tabId === '') throw new Error('sidebar: tabId is required')
-    const data = await callClient('focus', { tabId }, agent, signal)
-    return { text: `sidebar focus: ${tabId}${data?.onScreen === false ? ' (requested; the requesting Session is not on screen)' : ' requested'}` }
+    const sessionId = optionalSessionId(args)
+    const data = await callClient('focus', { tabId, ...(sessionId === undefined ? {} : { sessionId }) }, agent, signal)
+    const note = switchNote({ ...data, sessionId: data?.sessionId ?? sessionId })
+    return { text: `sidebar focus: ${tabId} requested${note === undefined ? '' : `\n${note}`}` }
   }
 
   async function executeClose(args, agent, signal) {
     const tabId = String(args.tabId ?? '')
     if (tabId === '') throw new Error('sidebar: tabId is required')
-    await callClient('close', { tabId }, agent, signal)
-    return { text: `sidebar close: ${tabId} closed` }
+    const sessionId = optionalSessionId(args)
+    const data = await callClient('close', { tabId, ...(sessionId === undefined ? {} : { sessionId }) }, agent, signal)
+    const note = switchNote({ ...data, sessionId: data?.sessionId ?? sessionId })
+    return { text: `sidebar close: ${tabId} closed${note === undefined ? '' : `\n${note}`}` }
+  }
+
+  /** Resolve the browser provider's read answer into the requested content mode. */
+  function browserReadContent(read, mode) {
+    if (mode === 'html') return read?.html ?? read?.value?.html
+    if (mode === 'elements') {
+      const elements = read?.elements ?? read?.value?.elements ?? read
+      return typeof elements === 'string' ? elements : elements === undefined ? undefined : JSON.stringify(elements, null, 2)
+    }
+    return read?.text ?? read?.value?.text
   }
 
   async function executeExpand(args, agent, signal) {
     const tabId = String(args.tabId ?? '')
     if (tabId === '') throw new Error('sidebar: tabId is required')
+    const sessionId = optionalSessionId(args)
     const maxChars = clampChars(args.maxChars, settings.maxExpandChars)
     const requestedMode = args.mode === 'elements' || args.mode === 'html' ? String(args.mode) : 'text'
-    const data = await callClient('expand', { tabId }, agent, signal)
+    const data = await callClient('expand', { tabId, ...(sessionId === undefined ? {} : { sessionId }) }, agent, signal)
     let content
     let note
+    let switched
+    const agentSessionId = typeof agent?.id === 'string' ? agent.id : undefined
+    const crossSession = typeof data?.sessionId === 'string' && agentSessionId !== undefined && data.sessionId !== agentSessionId
     if (data?.kind === 'browser') {
       try {
-        const read = await callBrowserProvider('read', { tabId, mode: requestedMode, maxChars }, agent, signal)
-        if (requestedMode === 'text') {
-          content = read?.text ?? read?.value?.text
-        } else if (requestedMode === 'html') {
-          content = read?.html ?? read?.value?.html
-        } else {
-          const elements = read?.elements ?? read?.value?.elements ?? read
-          content = typeof elements === 'string' ? elements : JSON.stringify(elements, null, 2)
+        if (crossSession) {
+          // The adopted browser provider scopes every tab to the querying Agent's
+          // Session, so another Session's tab cannot be read without reading the
+          // wrong tab (tab ids are per-Session). Report that instead of guessing.
+          note =
+            `browser content of another Session cannot be read through the session-scoped browser provider; only this tab's metadata is returned. ` +
+            `Read it from that Session's own conversation, or open the URL in this Session with sidebar open {kind:"browser",url}.`
+        } else if (data.onScreen !== true) {
+          // Reading a mounted guest needs its Session drawn; show it briefly.
+          switched = await callClient('switch', { sessionId: data.sessionId }, agent, signal)
+          await delay(250)
         }
-        if (typeof content !== 'string') note = 'the browser provider answered but returned no content for this mode; the page may be empty or still loading'
-        else if (content.length > maxChars) content = `${content.slice(0, maxChars)}\n… (${content.length - maxChars} more chars)`
-      } catch (error) {
-        note = `the browser provider could not read this tab: ${String(error && error.message ? error.message : error)}`
+        let lastError
+        for (let attempt = 0; attempt < (crossSession ? 0 : 3); attempt += 1) {
+          try {
+            const read = await callBrowserProvider('read', { tabId, mode: requestedMode, maxChars }, agent, signal)
+            content = browserReadContent(read, requestedMode)
+            lastError = undefined
+            break
+          } catch (error) {
+            lastError = error
+            await delay(300)
+          }
+        }
+        if (content === undefined && note === undefined) {
+          note =
+            lastError === undefined
+              ? 'the browser provider answered but returned no content for this mode; the page may be empty or still loading'
+              : `the browser provider could not read this tab: ${String(lastError && lastError.message ? lastError.message : lastError)}`
+        } else if (typeof content === 'string' && content.length > maxChars) {
+          content = `${content.slice(0, maxChars)}\n… (${content.length - maxChars} more chars)`
+        }
+      } finally {
+        if (switched?.switched === true) {
+          await callClient('restore', { sessionId: switched.previousSessionId, fromSessionId: data.sessionId }, agent, signal).catch(() => {})
+        }
       }
     } else if (typeof data?.path === 'string' && data.path !== '') {
       const base = isAbsolute(data.path) ? undefined : await sessionWorkingDirectory(agent, signal)
@@ -475,6 +574,8 @@ export function apply(ctx, config) {
     } else if (data?.kind === 'file' || data?.kind === 'text') {
       note = 'this file tab was opened before this Session; its path is not recorded here — read it with the file tools when you know the path'
     }
+    const switching = switchNote({ switched: switched?.switched === true, sessionId: data?.sessionId ?? sessionId, previousSessionId: switched?.previousSessionId })
+    if (switching !== undefined) note = note === undefined ? switching : `${note}\n${switching}`
     return { text: formatExpand(data, content, note, data?.kind === 'browser' ? requestedMode : undefined) }
   }
 
@@ -494,6 +595,7 @@ export function apply(ctx, config) {
             shellPath: { type: 'string', description: 'Shell executable for action=open, kind=terminal; the Sidebar default when omitted.' },
             tabId: { type: 'string', description: 'Tab id from action=status: used by focus/close/expand, and by open {kind:"browser"} to navigate that existing browser tab in place.' },
             includeAllSessions: { type: 'boolean', description: 'For action=status: include Sessions other than the requesting one.' },
+            sessionId: { type: 'string', description: 'Target Session for status/open/focus/close/expand (defaults to the requesting Session). Navigation commands briefly show that Session in the main view and restore the previously shown one.' },
             maxChars: { type: 'number', description: 'For action=expand: content character budget (default 4000, max 20000).' },
             mode: { type: 'string', enum: ['text', 'elements', 'html'], description: 'For action=expand on a browser tab: what to return (default text; elements carries the refs browser_act accepts; html is the page source).' },
           },
@@ -569,6 +671,10 @@ export const __test = {
   formatExpand,
   promptText,
 }
+
+
+
+
 
 
 

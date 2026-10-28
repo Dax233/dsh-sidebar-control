@@ -106,6 +106,9 @@ function makeProvider(options = {}) {
         return () => {}
       },
     },
+    get(key) {
+      return key === 'uiWorkspace' ? options.uiWorkspace : undefined
+    },
     effect(execute) {
       return execute()
     },
@@ -126,7 +129,7 @@ test('client: apply registers one inspect provider with the documented methods',
   assert.equal(plugin.name, 'dsh-sidebar-control')
   assert.deepEqual(json(plugin.inject), ['cordisInspect', 'sidebarRight'])
   assert.equal(manifest.id, 'SidebarControl')
-  assert.deepEqual(json(manifest.methods.map((method) => method.name)), ['status', 'open', 'focus', 'close', 'expand'])
+  assert.deepEqual(json(manifest.methods.map((method) => method.name)), ['status', 'open', 'focus', 'close', 'expand', 'switch', 'restore'])
 })
 
 test('client: status describes identity, mount state and browser guest URL/title', async () => {
@@ -211,23 +214,69 @@ test('client: open terminal and guide use their kinds', async () => {
   assert.deepEqual(json(calls.openTab[1].options), {})
 })
 
-test('client: commands for a Session whose Sidebar is not on screen are refused', async () => {
+test('client: status for an off-screen Session is read-only and never borrows the on-screen state', async () => {
   const { sidebarRight } = makeSidebar({ onScreen: 's2', inventory: [{ sessionId: 's1', tabId: 'tab1', kind: 'browser', contentId: 'a' }] })
   const { provider } = makeProvider({ sidebarRight })
-  await assert.rejects(() => provider.query('open', { kind: 'guide' }, SESSION), /Sidebar is not on screen/u)
-  await assert.rejects(() => provider.query('focus', { tabId: 'tab1' }, SESSION), /Sidebar is not on screen/u)
-  await assert.rejects(() => provider.query('close', { tabId: 'tab1' }, SESSION), /Sidebar is not on screen/u)
   const status = await provider.query('status', {}, SESSION)
   assert.equal(status.onScreen, false)
+  assert.equal(status.onScreenSessionId, 's2')
   assert.equal(status.sessions[0].onScreen, false)
   assert.equal(status.sessions[0].expanded, undefined, 'expanded comes from the on-screen Session and must not be attributed to another Session')
   assert.equal(status.sessions[0].activeTabId, undefined, 'activeTabId comes from the on-screen Session and must not be attributed to another Session')
 })
 
-test('client: expand refuses an off-screen Session as well', async () => {
+test('client: a command for an off-screen Session switches the app to it and restores the previous one', async () => {
+  const { sidebarRight, state, calls } = makeSidebar({ onScreen: 's2', inventory: [{ sessionId: 's1', tabId: 'tab1', kind: 'browser', contentId: 'a' }] })
+  const opened = []
+  const uiWorkspace = { openSession: (sessionId) => { opened.push(sessionId); state.onScreen = sessionId } }
+  const { provider } = makeProvider({ sidebarRight, uiWorkspace })
+  const data = await provider.query('focus', { tabId: 'tab1' }, SESSION)
+  assert.deepEqual(json(opened), ['s1', 's2'], 'show the target Session, then restore the previous one')
+  assert.equal(data.switched, true)
+  assert.equal(data.previousSessionId, 's2')
+  assert.equal(state.onScreen, 's2', 'the UI ends on the Session it started from')
+  assert.deepEqual(json(calls.focus), ['tab1'])
+})
+
+test('client: without the app session switcher an off-screen command fails clearly', async () => {
   const { sidebarRight } = makeSidebar({ onScreen: 's2', inventory: [{ sessionId: 's1', tabId: 'tab1', kind: 'browser', contentId: 'a' }] })
   const { provider } = makeProvider({ sidebarRight })
-  await assert.rejects(() => provider.query('expand', { tabId: 'tab1' }, SESSION), /Sidebar is not on screen/u)
+  await assert.rejects(() => provider.query('focus', { tabId: 'tab1' }, SESSION), /session switcher \(ctx\.uiWorkspace\) is unavailable/u)
+})
+
+test('client: switch and restore move the app view between Sessions', async () => {
+  const { sidebarRight, state } = makeSidebar({ onScreen: 's2', inventory: [{ sessionId: 's1', tabId: 'tab1', kind: 'browser', contentId: 'a' }] })
+  const opened = []
+  const uiWorkspace = { openSession: (sessionId) => { opened.push(sessionId); state.onScreen = sessionId } }
+  const { provider } = makeProvider({ sidebarRight, uiWorkspace })
+  const switched = await provider.query('switch', { sessionId: 's1' }, SESSION)
+  assert.equal(switched.switched, true)
+  assert.equal(switched.previousSessionId, 's2')
+  assert.equal(switched.onScreen, true)
+  const restored = await provider.query('restore', { sessionId: 's2' }, SESSION)
+  assert.equal(restored.restored, true)
+  assert.equal(state.onScreen, 's2')
+  assert.deepEqual(json(opened), ['s1', 's2'])
+})
+
+test('client: restore is skipped when the user navigated away during a temporary switch', async () => {
+  const { sidebarRight, state } = makeSidebar({ onScreen: 's1' })
+  const opened = []
+  const uiWorkspace = { openSession: (sessionId) => { opened.push(sessionId); state.onScreen = sessionId } }
+  const { provider } = makeProvider({ sidebarRight, uiWorkspace })
+  // The caller switched to s1 earlier, but the user has since opened s2.
+  state.onScreen = 's2'
+  const restored = await provider.query('restore', { sessionId: 's1', fromSessionId: 's1' }, SESSION)
+  assert.equal(restored.restored, false, 'a view the user moved away from must not be restored')
+  assert.deepEqual(json(opened), [])
+})
+
+test('client: expand of an off-screen Session reports the tab metadata without switching', async () => {
+  const { sidebarRight } = makeSidebar({ onScreen: 's2', inventory: [{ sessionId: 's1', tabId: 'tab1', kind: 'browser', contentId: 'a' }] })
+  const { provider } = makeProvider({ sidebarRight })
+  const data = await provider.query('expand', { tabId: 'tab1' }, SESSION)
+  assert.equal(data.tabId, 'tab1')
+  assert.equal(data.onScreen, false)
 })
 
 test('client: open reports pending when the inventory never grows', async () => {
@@ -283,6 +332,9 @@ test('client: pure address helpers keep drive letters and encode segments', () =
   assert.equal(helpers.encodeSegment('C:'), 'C:')
   assert.equal(helpers.isDrawn(null), false)
 })
+
+
+
 
 
 

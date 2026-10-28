@@ -39,6 +39,7 @@ function makeHarness(options = {}) {
       if (key === 'systemPrompt') return systemPrompt
       if (key === 'webServer') return options.webServer
       if (key === 'workingDirectory') return options.workingDirectory
+      if (key === 'agents') return options.agents
       return undefined
     },
     effect(execute) {
@@ -200,7 +201,7 @@ test('host: expand a browser tab pulls text through the adopted browser provider
     async query(_platform, provider, method) {
       this.calls.push({ provider, method })
       if (provider === 'SidebarControl') {
-        return { tabId: 'tab1', kind: 'browser', title: 'Example', url: 'https://example.com/', active: true, mounted: true, drawn: true }
+        return { tabId: 'tab1', kind: 'browser', title: 'Example', url: 'https://example.com/', active: true, mounted: true, drawn: true, onScreen: true }
       }
       if (provider === 'AgentBrowser') return { tabId: 'tab1', url: 'https://example.com/', title: 'Example', text: 'Example Domain body text' }
       throw new Error(`unexpected provider ${provider}`)
@@ -212,6 +213,82 @@ test('host: expand a browser tab pulls text through the adopted browser provider
   assert.match(result.text, /Example Domain body text/u)
   assert.match(result.text, /browser_read \{tabId:"tab1", mode:"elements"\}/u)
   assert.deepEqual(registry.calls.map((entry) => `${entry.provider}.${entry.method}`), ['SidebarControl.expand', 'AgentBrowser.read'])
+})
+
+test('host: expanding a browser tab of another Session returns metadata only (session-scoped browser provider)', async () => {
+  const calls = []
+  const registry = {
+    async query(_platform, provider, method, input) {
+      calls.push({ provider, method, input })
+      if (provider === 'SidebarControl' && method === 'expand') {
+        return { tabId: 'tab7', kind: 'browser', sessionId: 'target-session', title: 'Remote', url: 'https://example.org/', onScreen: false }
+      }
+      throw new Error(`the browser provider must not be queried for another Session's tab (${provider}.${method})`)
+    },
+  }
+  const { tool } = makeHarness({ registry })
+  const result = await tool.execute({ action: 'expand', tabId: 'tab7', sessionId: 'target-session' }, { agent: { id: 'home-session' } })
+  assert.match(result.text, /session-scoped browser provider/u)
+  assert.match(result.text, /https:\/\/example\.org\//u)
+  assert.deepEqual(calls.map((entry) => `${entry.provider}.${entry.method}`), ['SidebarControl.expand'])
+})
+
+test('host: expanding a browser tab of the requesting Session that is off screen switches for the read and restores', async () => {
+  const calls = []
+  const registry = {
+    async query(_platform, provider, method, input) {
+      calls.push({ provider, method, input })
+      if (provider === 'SidebarControl' && method === 'expand') {
+        return { tabId: 'tab7', kind: 'browser', sessionId: 'home-session', title: 'Home', url: 'https://example.org/', onScreen: false }
+      }
+      if (provider === 'SidebarControl' && method === 'switch') return { sessionId: 'home-session', switched: true, previousSessionId: 'other-session', onScreen: true }
+      if (provider === 'SidebarControl' && method === 'restore') return { sessionId: 'other-session', restored: true }
+      if (provider === 'AgentBrowser' && method === 'read') return { tabId: 'tab7', text: 'home page text' }
+      throw new Error(`unexpected ${provider}.${method}`)
+    },
+  }
+  const { tool } = makeHarness({ registry })
+  const result = await tool.execute({ action: 'expand', tabId: 'tab7' }, { agent: { id: 'home-session' } })
+  assert.match(result.text, /home page text/u)
+  assert.match(result.text, /temporarily showed Session home-ses…/u)
+  assert.deepEqual(
+    calls.map((entry) => `${entry.provider}.${entry.method}`),
+    ['SidebarControl.expand', 'SidebarControl.switch', 'AgentBrowser.read', 'SidebarControl.restore'],
+  )
+})
+
+test('host: open for another Session forwards sessionId and receipt explains the temporary switch', async () => {
+  const calls = []
+  const registry = {
+    async query(_platform, provider, method, input) {
+      calls.push({ provider, method, input })
+      return { kind: 'file', sessionId: 'target-session', switched: true, previousSessionId: 'home-session', tabId: 'tab8', path: input.path }
+    },
+  }
+  const workingDirectory = { ensure: async () => join(tmpdir(), 'home-workspace') }
+  const { tool } = makeHarness({ registry, workingDirectory })
+  const result = await tool.execute({ action: 'open', kind: 'file', path: 'notes.md', sessionId: 'target-session' }, { agent: {} })
+  assert.equal(calls[0].input.sessionId, 'target-session')
+  assert.match(result.text, /temporarily showed Session target-s…/u)
+  assert.match(result.text, /tab tab8/u)
+})
+
+test('host: reusing a browser tab of another Session is refused with the new-tab alternative', async () => {
+  const calls = []
+  const registry = {
+    async query(_platform, provider, method) {
+      calls.push({ provider, method })
+      throw new Error(`no client query expected (${provider}.${method})`)
+    },
+  }
+  const { tool } = makeHarness({ registry })
+  const result = await tool.execute(
+    { action: 'open', kind: 'browser', url: 'https://example.org/', tabId: 'tab4', sessionId: 'target-session' },
+    { agent: { id: 'home-session' } },
+  )
+  assert.match(result.text, /cannot navigate tab tab4 in another Session/u)
+  assert.match(result.text, /Open a new browser tab there/u)
+  assert.equal(calls.length, 0)
 })
 
 test('host: expand a browser tab degrades when the browser provider is unavailable', async () => {
@@ -304,6 +381,21 @@ test('host: a relative file path resolves against the Session working directory'
   assert.equal(calls[0].input.path, join(tmpdir(), 'session-workspace', 'notes.md'))
 })
 
+test('host: a relative path for another Session resolves against that Session workspace', async () => {
+  const calls = []
+  const registry = {
+    async query(_platform, _provider, _method, input) {
+      calls.push(input)
+      return { kind: 'file', tabId: 'tab10', sessionId: 'target-session' }
+    },
+  }
+  const workingDirectory = { ensure: async (agent) => join(tmpdir(), agent.id === 'target-session' ? 'target-ws' : 'home-ws') }
+  const agents = { get: (id) => (id === 'target-session' ? { id: 'target-session' } : undefined) }
+  const { tool } = makeHarness({ registry, workingDirectory, agents })
+  await tool.execute({ action: 'open', kind: 'file', path: 'notes.md', sessionId: 'target-session' }, { agent: { id: 'home-session' } })
+  assert.equal(calls[0].path, join(tmpdir(), 'target-ws', 'notes.md'))
+})
+
 test('host: open browser with an existing tabId navigates that tab instead of opening another', async () => {
   const calls = []
   const registry = {
@@ -390,6 +482,9 @@ test('host: tool refuses without an Agent-backed Session', async () => {
   const { tool } = makeHarness()
   await assert.rejects(() => tool.execute({ action: 'status' }, {}), /Agent-backed Session/u)
 })
+
+
+
 
 
 

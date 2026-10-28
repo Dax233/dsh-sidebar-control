@@ -54,6 +54,15 @@ never re-implements page reading. It talks to the renderer through the Cordis In
 - **Progressive disclosure.** The prompt section lists at most a handful of tabs as an overview;
   full content and the exact follow-up tools appear only in `sidebar expand` results, so the
   context budget follows actual need.
+- **Another Session is reachable (0.2.0).** Pass `sessionId` to `status`/`open`/`focus`/`close`/`expand`.
+  Read-only `status` needs no switch. Navigation commands ask the app to show that Session (the
+  same path a session-row click takes) and then restore the Session that was on screen, so the
+  view flickers briefly; receipts say which Sessions were involved. `expand` of a file tab works
+  without a switch (the Host reads the file directly) and relative paths resolve against the
+  target Session's working directory. Two limits stay, both from the adopted browser plugin's
+  session-scoped contract: the **content** of another Session's browser tab cannot be read (only
+  its metadata is returned), and an existing browser tab of another Session cannot be navigated
+  by `tabId` (open a new tab there instead).
 
 ## Install
 
@@ -97,5 +106,6 @@ stays with the tools that do (and those already wrap page content as untrusted d
 ## License
 
 MIT.
+
 
 
