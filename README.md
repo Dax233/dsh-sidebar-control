@@ -57,12 +57,18 @@ never re-implements page reading. It talks to the renderer through the Cordis In
 ## Install
 
 ```sh
-dsh plugin --profile desktop add file:F:/github/dsh-sidebar-control
+dsh plugin --profile desktop add github:Dax233/dsh-sidebar-control
 ```
 
-Or through the Plugins page. The bundle patch mounts the Host half; `package.json`'s
-`dsh.client` loads the renderer half. Restart DSH Desktop after installation (or let the plugin
-manager apply the bundle live).
+Or through the Plugins page (`github:Dax233/dsh-sidebar-control`). The bundle patch mounts the
+Host half; `package.json`'s `dsh.client` loads the renderer half. The plugin manager can apply the
+bundle live; otherwise restart DSH Desktop.
+
+Local development install (a `file:` copy, so reinstall after edits):
+
+```sh
+dsh plugin --profile desktop add file:F:/github/dsh-sidebar-control
+```
 
 Recommended companion (browser content): `github:guanhaisen/dsh-agent-browser`.
 
@@ -90,3 +96,4 @@ stays with the tools that do (and those already wrap page content as untrusted d
 ## License
 
 MIT.
+
