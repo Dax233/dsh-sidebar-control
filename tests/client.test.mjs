@@ -148,6 +148,7 @@ test('client: status describes identity, mount state and browser guest URL/title
   const data = await provider.query('status', {}, SESSION)
   assert.equal(data.requestedSessionId, 's1')
   assert.equal(data.onScreen, true)
+  assert.equal(data.onScreenSessionId, 's1', 'status names the Session whose Sidebar is on screen')
   assert.equal(data.sessions.length, 1, 'without includeAllSessions only the requesting Session is described')
   const tabs = data.sessions[0].tabs
   assert.equal(tabs.length, 2)
@@ -282,5 +283,6 @@ test('client: pure address helpers keep drive letters and encode segments', () =
   assert.equal(helpers.encodeSegment('C:'), 'C:')
   assert.equal(helpers.isDrawn(null), false)
 })
+
 
 

@@ -190,7 +190,10 @@ function formatStatus(data, settings) {
     lines.push('Open something with sidebar open {kind:"browser",url} | {kind:"file",path} | {kind:"terminal"} | {kind:"guide"}.')
   }
   if (data?.onScreen !== true) {
-    lines.push('note: the requesting Session is not the one on screen; open/focus/close act on the on-screen Session only.')
+    const onScreen = typeof data?.onScreenSessionId === 'string' && data.onScreenSessionId !== '' ? shortSession(data.onScreenSessionId) : undefined
+    lines.push(
+      `note: the requesting Session is not the one on screen${onScreen === undefined ? '' : ` (on-screen session ${onScreen})`}; open/focus/close act on the on-screen Session only.`,
+    )
   }
   return lines.join('\n')
 }
@@ -566,5 +569,6 @@ export const __test = {
   formatExpand,
   promptText,
 }
+
 
 

@@ -329,6 +329,7 @@ window.__ModuleLoader__.load({
       return plain({
         requestedSessionId: requested,
         onScreen: sessions.some((session) => session.sessionId === requested && session.onScreen),
+        onScreenSessionId: onScreenSession(ctx),
         sessions,
       });
     }
@@ -566,6 +567,7 @@ window.__ModuleLoader__.load({
     return module.exports;
   },
 });
+
 
 
 
