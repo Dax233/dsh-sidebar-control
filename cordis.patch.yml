@@ -1,0 +1,7 @@
+# dsh-sidebar-control bundle patch.
+#
+# One insert mounts the Host half (the `sidebar` tool + prompt section).
+# The client half is declared by package.json's `dsh.client` and binds to this row.
+- insert:
+    - id: dsh-sidebar-control
+      name: 'dsh-sidebar-control'
